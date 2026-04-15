@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -315,6 +316,9 @@ func (b *PartitionBuilder) buildProportionalPartitions(
 			continue
 		}
 
+		// Parse NUMA node ID for topology-aware CEL selectors
+		numaVal, _ := strconv.ParseInt(numaKey, 10, 64)
+
 		// Create subdivided partitions
 		for i := 0; i < subdivisions; i++ {
 			p := PartitionDevice{
@@ -322,6 +326,7 @@ func (b *PartitionBuilder) buildProportionalPartitions(
 				NodeName:           nodeName,
 				Type:               partType,
 				Profile:            profile,
+				NUMANodes:          []int64{numaVal},
 				DeviceCounts:       make(map[string]int),
 				Devices:            nil, // representative only
 				ExtendedAttributes: make(map[string]DeviceAttributeValue),
