@@ -247,6 +247,13 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 			}
 		}
 
+		// Forward any user-specified selectors from the original partition request
+		// to each expanded sub-request. This enables NUMA pinning (e.g.,
+		// numaNode==0) and other user-specified device filtering.
+		if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
+			exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
+		}
+
 		subRequests = append(subRequests, resourcev1.DeviceRequest{
 			Name:    name,
 			Exactly: exact,
