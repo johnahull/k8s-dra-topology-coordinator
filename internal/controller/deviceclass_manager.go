@@ -141,7 +141,7 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 		numa := dc.Labels[CoordinatorDriverName+"/numa"]
 		key := profile + "-" + partType
 		if numa != "" {
-			key += numa
+			key += "-" + numa
 		}
 		if _, exists := active[key]; !exists {
 			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
@@ -184,7 +184,7 @@ func (m *DeviceClassManager) buildDeviceClass(profile string, partType Partition
 		CoordinatorDriverName + "/partitionType": string(partType),
 	}
 	if nameSuffix != "" {
-		labels[CoordinatorDriverName+"/numa"] = nameSuffix
+		labels[CoordinatorDriverName+"/numa"] = strings.TrimPrefix(nameSuffix, "-")
 	}
 
 	return &resourcev1.DeviceClass{
