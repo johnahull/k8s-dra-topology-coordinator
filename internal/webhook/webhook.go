@@ -247,6 +247,18 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 			}
 		}
 
+		// Apply per-driver CEL selectors from the PartitionConfig.
+		// These pin each sub-request to the correct NUMA node using the
+		// driver's own attribute namespace (e.g., gpu.amd.com/numaNode),
+		// eliminating the need for a common cross-driver attribute name.
+		for _, cel := range sr.Selectors {
+			exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
+				CEL: &resourcev1.CELDeviceSelector{
+					Expression: cel,
+				},
+			})
+		}
+
 		subRequests = append(subRequests, resourcev1.DeviceRequest{
 			Name:    name,
 			Exactly: exact,
