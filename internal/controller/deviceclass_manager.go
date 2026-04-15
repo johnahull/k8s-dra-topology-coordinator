@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -30,8 +32,13 @@ type PartitionConfig struct {
 
 // SubResourceConfig defines a sub-resource that a partition contains.
 type SubResourceConfig struct {
-	DeviceClass string `json:"deviceClass"`
-	Count       int    `json:"count"`
+	DeviceClass string            `json:"deviceClass"`
+	Count       int               `json:"count"`
+	// Capacity specifies consumable capacity requests for shared devices.
+	// When set, the device is shared via DRAConsumableCapacity instead of
+	// exclusive allocation. The key is the capacity name (e.g., "dra.cpu/cpu"),
+	// the value is the quantity string (e.g., "16").
+	Capacity map[string]string `json:"capacity,omitempty"`
 }
 
 // AlignmentConfig defines a matchAttribute constraint for the combined claim.
@@ -74,7 +81,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	seen := make(map[string]*profilePartition)
 	for _, result := range results {
 		for _, partition := range result.Partitions {
-			key := result.Profile + "-" + string(partition.Type)
+			key := truncateLabel(result.Profile) + "-" + string(partition.Type)
 			if _, ok := seen[key]; !ok {
 				seen[key] = &profilePartition{
 					profile:        result.Profile,
@@ -156,7 +163,7 @@ func (m *DeviceClassManager) buildDeviceClass(profile string, partType Partition
 			Name: name,
 			Labels: map[string]string{
 				CoordinatorDriverName + "/managed":       "true",
-				CoordinatorDriverName + "/profile":       profile,
+				CoordinatorDriverName + "/profile":       truncateLabel(profile),
 				CoordinatorDriverName + "/partitionType": string(partType),
 			},
 		},
@@ -188,12 +195,18 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		Kind: "PartitionConfig",
 	}
 
-	// Sub-resources: one entry per driver with its device count
+	// Sub-resources: one entry per driver with its device count and optional capacity
 	for driver, count := range representative.DeviceCounts {
-		config.SubResources = append(config.SubResources, SubResourceConfig{
+		sr := SubResourceConfig{
 			DeviceClass: driver,
 			Count:       count,
-		})
+		}
+		if representative.DeviceCapacity != nil {
+			if cap, ok := representative.DeviceCapacity[driver]; ok {
+				sr.Capacity = cap
+			}
+		}
+		config.SubResources = append(config.SubResources, sr)
 	}
 
 	// Standard alignments
@@ -209,30 +222,13 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		Enforcement: EnforcementRequired,
 	})
 
-	// PCIe alignment between PCI sub-resources only.
-	// Non-PCI drivers (e.g., dra.cpu) don't publish pcieRoot and must be excluded,
-	// otherwise the matchAttribute constraint is unsatisfiable.
-	// Alignment is only needed when 2+ PCI drivers exist to align.
-	if len(representative.DeviceCounts) > 1 {
-		pciDrivers := make(map[string]bool)
-		for _, dev := range representative.Devices {
-			if dev.PCIeRoot != nil {
-				pciDrivers[dev.DriverName] = true
-			}
-		}
-
-		if len(pciDrivers) > 1 {
-			subResourceNames := make([]string, 0, len(pciDrivers))
-			for driver := range pciDrivers {
-				subResourceNames = append(subResourceNames, driver)
-			}
-			config.Alignments = append(config.Alignments, AlignmentConfig{
-				Attribute:   AttrPCIeRoot,
-				Requests:    subResourceNames,
-				Enforcement: EnforcementRequired,
-			})
-		}
-	}
+	// PCIe root alignment is NOT added for cross-driver partitions.
+	// GPUs and NICs have different PCIe roots, so requiring them to share
+	// a PCIe root makes the constraint unsatisfiable. NUMA alignment is
+	// sufficient for cross-driver co-placement.
+	// PCIe root alignment would only be useful for multiple devices of the
+	// SAME driver type (e.g., 2 GPUs on the same PCIe switch), which is
+	// handled by the eighth partition level.
 
 	// Match constraint alignments from topology rules
 	matchRules := m.rules.GetMatchConstraintRules()
@@ -277,13 +273,28 @@ func (m *DeviceClassManager) deviceClassName(profile string, partType PartitionT
 		sanitized = "default"
 	}
 
-	// Truncate to fit within DNS label limits (63 chars max)
-	name := sanitized + "-" + string(partType)
-	if len(name) > 63 {
-		name = name[:63]
+	// Truncate profile to fit within DNS label limits (63 chars max)
+	// Keep partition type suffix intact for uniqueness
+	suffix := "-" + string(partType)
+	maxProfileLen := 63 - len(suffix)
+	if len(sanitized) > maxProfileLen {
+		h := sha256.Sum256([]byte(sanitized))
+		hash := hex.EncodeToString(h[:4])
+		sanitized = sanitized[:maxProfileLen-9] + "-" + hash
 	}
 
-	return name
+	return sanitized + suffix
+}
+
+// truncateLabel truncates a string to fit K8s label value limits (63 chars max).
+// If truncation is needed, appends a short hash to preserve uniqueness.
+func truncateLabel(s string) string {
+	if len(s) <= 63 {
+		return s
+	}
+	h := sha256.Sum256([]byte(s))
+	hash := hex.EncodeToString(h[:4]) // 8 hex chars
+	return s[:54] + "-" + hash
 }
 
 // publishDeviceClass creates or updates a DeviceClass.

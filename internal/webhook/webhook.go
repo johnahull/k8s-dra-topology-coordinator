@@ -12,6 +12,7 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -228,12 +229,27 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 		requestNameMap[sr.DeviceClass] = name
 
 		count := int64(sr.Count)
+		exact := &resourcev1.ExactDeviceRequest{
+			DeviceClassName: sr.DeviceClass,
+			Count:           count,
+		}
+
+		// Add capacity requests for shared devices (DRAConsumableCapacity)
+		if len(sr.Capacity) > 0 {
+			exact.Capacity = &resourcev1.CapacityRequirements{
+				Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+			}
+			for capName, capVal := range sr.Capacity {
+				qty, err := resource.ParseQuantity(capVal)
+				if err == nil {
+					exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+				}
+			}
+		}
+
 		subRequests = append(subRequests, resourcev1.DeviceRequest{
-			Name: name,
-			Exactly: &resourcev1.ExactDeviceRequest{
-				DeviceClassName: sr.DeviceClass,
-				Count:           count,
-			},
+			Name:    name,
+			Exactly: exact,
 		})
 	}
 
