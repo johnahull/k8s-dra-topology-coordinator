@@ -243,7 +243,7 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 // It counts PCIe root groups per NUMA to determine the subdivision factor,
 // then divides all device types proportionally. Shared devices (count=1 per NUMA)
 // get capacity divided via DRAConsumableCapacity.
-func (b *PartitionBuilder) buildProportionalPartitions(
+func (b *PartitionBuilder) buildProportionalPartitions( //nolint:unparam
 	nodeName, profile string,
 	partType PartitionType,
 	byNUMA map[string][]TopologyDevice,
