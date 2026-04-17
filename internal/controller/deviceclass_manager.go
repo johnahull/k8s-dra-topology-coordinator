@@ -410,23 +410,36 @@ func numaKeySuffix(numaNodes []int64) string {
 func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string, driverCounts map[string]int) bool {
 	groups := make(map[string]map[string]int) // attrValue → baseDriverName → count
 
+	// Track which drivers actually publish this attribute
+	driversWithAttribute := make(map[string]bool)
+
 	for _, dev := range devices {
 		val := deviceAttributeValueString(dev, attribute)
 		if val == "" {
 			continue // Device doesn't publish this attribute
 		}
 		driver := baseDriverName(dev.DriverName)
+		driversWithAttribute[driver] = true
 		if groups[val] == nil {
 			groups[val] = make(map[string]int)
 		}
 		groups[val][driver]++
 	}
 
+	// Need at least 2 drivers with the attribute for a meaningful constraint
+	if len(driversWithAttribute) < 2 {
+		return false
+	}
+
 	for _, driverMap := range groups {
 		satisfied := true
 		for driver, needed := range driverCounts {
-			// Normalize driver name consistently with device grouping
 			base := baseDriverName(driver)
+			// Only check drivers that actually publish this attribute.
+			// CPU/memory don't publish pcieRoot — skip them.
+			if !driversWithAttribute[base] {
+				continue
+			}
 			if driverMap[base] < needed {
 				satisfied = false
 				break
