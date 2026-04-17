@@ -87,36 +87,35 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 // SyncDeviceClasses creates or updates DeviceClass objects for each partition type
 // discovered across all nodes.
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
-	// Collect all unique partition types and their profiles
+	// Collect all unique partition types and their profiles.
+	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
 	type profilePartition struct {
-		profile  string
-		partType PartitionType
-		// Representative partition for computing sub-resource counts
+		profile        string
+		partType       PartitionType
 		representative PartitionDevice
+		cachedConfig   PartitionConfig
+		cachedCoupling CouplingLevel
 	}
 
 	seen := make(map[string]*profilePartition)
 	for _, result := range results {
 		for _, partition := range result.Partitions {
-			// Include NUMA info in key for NUMA-specific partitions.
-			// This creates separate DeviceClasses per NUMA node (e.g.,
-			// quarter-numa0, quarter-numa1) so each can have per-driver
-			// CEL selectors using driver-specific attribute names.
-			// Compute coupling level for this partition to include in the key.
-			// Partitions with different coupling levels need separate DeviceClasses.
-			_, partCoupling := m.buildPartitionConfig(partition.Type, partition)
+			// Compute partition config and coupling level once.
+			config, coupling := m.buildPartitionConfig(partition.Type, partition)
 			key := truncateLabel(result.Profile) + "-" + string(partition.Type)
 			if len(partition.NUMANodes) > 0 && partition.Type != PartitionFull {
 				key += numaKeySuffix(partition.NUMANodes)
 			}
-			if partCoupling != CouplingNone {
-				key += "-" + string(partCoupling)
+			if coupling != CouplingNone {
+				key += "-" + string(coupling)
 			}
 			if _, ok := seen[key]; !ok {
 				seen[key] = &profilePartition{
 					profile:        result.Profile,
 					partType:       partition.Type,
 					representative: partition,
+					cachedConfig:   config,
+					cachedCoupling: coupling,
 				}
 			}
 		}
@@ -124,7 +123,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Create/update a DeviceClass for each profile+partitionType
 	for _, pp := range seen {
-		dc := m.buildDeviceClass(pp.profile, pp.partType, pp.representative)
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
 		}
@@ -178,16 +177,13 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 	return nil
 }
 
-// buildDeviceClass constructs a DeviceClass for a given profile and partition type.
-func (m *DeviceClassManager) buildDeviceClass(profile string, partType PartitionType, representative PartitionDevice) *resourcev1.DeviceClass {
+// buildDeviceClassFromCache constructs a DeviceClass using pre-computed config and coupling.
+func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType PartitionType, representative PartitionDevice, config PartitionConfig, coupling CouplingLevel) *resourcev1.DeviceClass {
 	nameSuffix := ""
 	if len(representative.NUMANodes) > 0 && partType != PartitionFull {
 		nameSuffix = numaKeySuffix(representative.NUMANodes)
 	}
-	// Build the opaque config first to determine coupling level
-	config, coupling := m.buildPartitionConfig(partType, representative)
 
-	// Include coupling in the DeviceClass name so tight and loose get separate names
 	name := m.deviceClassName(profile, partType) + nameSuffix
 	if coupling != CouplingNone {
 		name += "-" + string(coupling)
@@ -320,16 +316,15 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 					Requests:    requestNames,
 					Enforcement: enforcement,
 				})
-				if coupling == CouplingNone {
-					coupling = CouplingTight
-				}
+				// Upgrade coupling to tight (never downgrade from tight)
+				coupling = CouplingTight
 				klog.V(2).Infof("Partition %s: primary constraint %s satisfiable (tight coupling)",
 					representative.Name, rule.Attribute)
 			} else {
 				// Primary unsatisfiable — fall back to looser alignment.
 				// Per-driver NUMA CEL selectors are already in place, so we
 				// just don't add the primary matchAttribute constraint.
-				if coupling == CouplingNone {
+				if coupling != CouplingTight {
 					coupling = CouplingLoose
 				}
 				klog.V(2).Infof("Partition %s: primary constraint %s unsatisfiable, falling back to %s (loose coupling)",
@@ -413,12 +408,12 @@ func numaKeySuffix(numaNodes []int64) string {
 // the attribute value and checks if any group meets all driver count requirements.
 // This is a local check on the partition's Devices slice, not a cluster-wide check.
 func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string, driverCounts map[string]int) bool {
-	groups := make(map[string]map[string]int) // attrValue → driverName → count
+	groups := make(map[string]map[string]int) // attrValue → baseDriverName → count
 
 	for _, dev := range devices {
 		val := deviceAttributeValueString(dev, attribute)
 		if val == "" {
-			continue
+			continue // Device doesn't publish this attribute
 		}
 		driver := baseDriverName(dev.DriverName)
 		if groups[val] == nil {
@@ -430,7 +425,9 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 	for _, driverMap := range groups {
 		satisfied := true
 		for driver, needed := range driverCounts {
-			if driverMap[driver] < needed {
+			// Normalize driver name consistently with device grouping
+			base := baseDriverName(driver)
+			if driverMap[base] < needed {
 				satisfied = false
 				break
 			}
