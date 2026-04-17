@@ -691,8 +691,8 @@ func makeTopologyResourceSlice(name, driver, nodeName, poolName string, numaNode
 		devices = append(devices, resourcev1.Device{
 			Name: fmt.Sprintf("dev-%d", i),
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				resourcev1.QualifiedName("dra.net/numaNode"):  {IntValue: &numaNode},
-				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"):     {StringValue: &pcieRoot},
+				resourcev1.QualifiedName("dra.net/numaNode"):                {IntValue: &numaNode},
+				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"): {StringValue: &pcieRoot},
 			},
 		})
 	}
