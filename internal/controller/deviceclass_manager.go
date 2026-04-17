@@ -290,12 +290,6 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	// per-driver CEL selector derived from topology rules. This eliminates the
 	// requirement for all drivers to publish NUMA under a common attribute name.
 
-	// Standard alignments (request names for any remaining matchAttribute constraints)
-	requestNames := []string{"partition"}
-	for driver := range representative.DeviceCounts {
-		requestNames = append(requestNames, driver)
-	}
-
 	// Match constraint alignments from topology rules with distance-based fallback.
 	// For rules with FallbackAttribute, check if the primary constraint is satisfiable
 	// for this partition's devices. If yes, emit it (tight coupling). If not, skip it
@@ -312,6 +306,34 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 			enforcement = EnforcementRequired
 		}
 
+		// Build request names for this constraint: only include drivers whose
+		// devices actually publish the attribute. CPU and memory don't publish
+		// pcieRoot, so including them in a pcieRoot matchAttribute makes the
+		// constraint unsatisfiable.
+		var constraintRequests []string
+		if len(representative.Devices) > 0 {
+			driversWithAttribute := make(map[string]bool)
+			for _, dev := range representative.Devices {
+				val := deviceAttributeValueString(dev, rule.Attribute)
+				if val != "" {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range representative.DeviceCounts {
+				if driversWithAttribute[baseDriverName(driver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+			if len(constraintRequests) == 0 {
+				continue
+			}
+		} else {
+			// No device data available — include all drivers
+			for driver := range representative.DeviceCounts {
+				constraintRequests = append(constraintRequests, driver)
+			}
+		}
+
 		if rule.FallbackAttribute != "" {
 			// Distance-based fallback: check if primary constraint is satisfiable
 			// for this specific partition's devices.
@@ -319,7 +341,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 				// Primary (tight) constraint works for this partition
 				config.Alignments = append(config.Alignments, AlignmentConfig{
 					Attribute:   rule.Attribute,
-					Requests:    requestNames,
+					Requests:    constraintRequests,
 					Enforcement: enforcement,
 				})
 				// Upgrade coupling to tight (never downgrade from tight)
@@ -340,7 +362,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 			// No fallback: emit as before
 			config.Alignments = append(config.Alignments, AlignmentConfig{
 				Attribute:   rule.Attribute,
-				Requests:    requestNames,
+				Requests:    constraintRequests,
 				Enforcement: enforcement,
 			})
 		}
