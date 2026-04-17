@@ -264,6 +264,12 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		// rules tell us which attribute name each driver uses.
 		if len(representative.NUMANodes) > 0 {
 			if attr, ok := m.rules.GetNUMAAttributeForDriver(driver); ok {
+				// Qualify unqualified attributes with the driver name.
+				// E.g., "numaNode" for driver "gpu.amd.com" → "gpu.amd.com/numaNode"
+				// so the CEL expression uses device.attributes["gpu.amd.com"].numaNode
+				if !strings.Contains(attr, "/") {
+					attr = driver + "/" + attr
+				}
 				cel := BuildNUMACELSelector(attr, representative.NUMANodes)
 				if cel != "" {
 					sr.Selectors = append(sr.Selectors, cel)
