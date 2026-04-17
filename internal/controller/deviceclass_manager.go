@@ -32,8 +32,8 @@ type PartitionConfig struct {
 
 // SubResourceConfig defines a sub-resource that a partition contains.
 type SubResourceConfig struct {
-	DeviceClass string            `json:"deviceClass"`
-	Count       int               `json:"count"`
+	DeviceClass string `json:"deviceClass"`
+	Count       int    `json:"count"`
 	// Capacity specifies consumable capacity requests for shared devices.
 	// When set, the device is shared via DRAConsumableCapacity instead of
 	// exclusive allocation. The key is the capacity name (e.g., "dra.cpu/cpu"),
