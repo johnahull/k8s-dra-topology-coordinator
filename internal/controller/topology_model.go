@@ -10,12 +10,26 @@ import (
 	klog "k8s.io/klog/v2"
 )
 
-// Standard topology attribute qualified names that all participating DRA drivers must publish.
+// Standard topology attribute qualified names.
 const (
-	AttrNUMANode = "dra.net/numaNode"
+	AttrNUMANode = "resource.kubernetes.io/numaNode"
 	AttrPCIeRoot = "resource.kubernetes.io/pcieRoot"
 	AttrSocket   = "nodepartition.dra.k8s.io/socket"
 )
+
+// numaNodeAliases lists all known NUMA attribute names published by DRA
+// drivers. The coordinator checks each of these when extracting NUMA
+// topology from device attributes. The first match wins (standard name
+// is checked first via AttrNUMANode above).
+var numaNodeAliases = []string{
+	"nodepartition.dra.k8s.io/numaNode",
+	"dra.net/numaNode",
+	"dra.cpu/numaNodeID",
+	"dra.memory/numaNode",
+	"dra.nvme/numaNode",
+	"numaNode",
+	"numa",
+}
 
 // TopologyDevice represents a single device from a DRA driver's ResourceSlice,
 // enriched with its topology attributes.
@@ -436,6 +450,16 @@ func (m *TopologyModel) extractTopologyDevice(
 				td.Socket = attr.IntValue
 			}
 			continue
+		}
+
+		// Check NUMA node aliases — only set if not already found
+		if td.NUMANode == nil {
+			for _, alias := range numaNodeAliases {
+				if name == alias && attr.IntValue != nil {
+					td.NUMANode = attr.IntValue
+					break
+				}
+			}
 		}
 
 		// Check topology rules for driver-specific attribute mappings

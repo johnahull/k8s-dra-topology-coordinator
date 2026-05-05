@@ -132,7 +132,7 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 
 	// NUMA alignment is now handled by per-driver CEL selectors, not matchAttribute.
 	// This partition has no NUMANodes set, so sub-resources should have fallback
-	// CEL selectors using the standard dra.net/numaNode attribute.
+	// CEL selectors using the standard resource.kubernetes.io/numaNode attribute.
 	// No NUMA matchAttribute alignment should exist.
 	for _, a := range config.Alignments {
 		if a.Attribute == AttrNUMANode {
@@ -213,7 +213,7 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 		}
 	}
 
-	// Each sub-resource should have a fallback NUMA CEL selector using dra.net/numaNode
+	// Each sub-resource should have a fallback NUMA CEL selector using resource.kubernetes.io/numaNode
 	// (no topology rules configured, so fallback to standard attribute)
 	for _, sr := range config.SubResources {
 		assert.NotEmpty(t, sr.Selectors,

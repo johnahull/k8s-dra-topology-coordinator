@@ -275,7 +275,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 					sr.Selectors = append(sr.Selectors, cel)
 				}
 			} else {
-				// Fallback: driver publishes the standard dra.net/numaNode directly
+				// Fallback: driver publishes the standard resource.kubernetes.io/numaNode directly
 				cel := BuildNUMACELSelector(AttrNUMANode, representative.NUMANodes)
 				if cel != "" {
 					sr.Selectors = append(sr.Selectors, cel)
