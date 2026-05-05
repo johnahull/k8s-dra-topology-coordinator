@@ -21,6 +21,14 @@ const (
 // drivers. The coordinator checks each of these when extracting NUMA
 // topology from device attributes. The first match wins (standard name
 // is checked first via AttrNUMANode above).
+var socketAliases = []string{
+	"resource.kubernetes.io/cpuSocketID",
+	"dra.cpu/cpuSocketID",
+	"dra.memory/cpuSocketID",
+	"cpuSocketID",
+	"socket",
+}
+
 var numaNodeAliases = []string{
 	"nodepartition.dra.k8s.io/numaNode",
 	"dra.net/numaNode",
@@ -457,6 +465,16 @@ func (m *TopologyModel) extractTopologyDevice(
 			for _, alias := range numaNodeAliases {
 				if name == alias && attr.IntValue != nil {
 					td.NUMANode = attr.IntValue
+					break
+				}
+			}
+		}
+
+		// Check socket aliases — only set if not already found
+		if td.Socket == nil {
+			for _, alias := range socketAliases {
+				if name == alias && attr.IntValue != nil {
+					td.Socket = attr.IntValue
 					break
 				}
 			}
