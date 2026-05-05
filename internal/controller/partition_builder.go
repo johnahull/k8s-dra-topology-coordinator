@@ -146,36 +146,67 @@ func (b *PartitionBuilder) buildNodePartitions(
 		}
 	}
 
-	// Build partitions at each granularity level
+	// Build partitions by successive bisection.
+	// Walk socket → NUMA → PCIe root; assign half/quarter/eighth
+	// to boundaries that actually split. Skip boundaries that don't.
 	profile := b.inferProfile(driverDeviceCounts)
 	result.Profile = profile
 
-	// Eighth: subdivide each NUMA node proportionally by PCIe root count.
-	// Each eighth gets 1 GPU + proportional NICs + shared CPU/memory with divided capacity.
-	eighths := b.buildProportionalPartitions(nodeName, profile, PartitionEighth, byNUMA, byPCIeRoot, allDevices)
-	result.Partitions = append(result.Partitions, eighths...)
+	tiers := []PartitionType{PartitionHalf, PartitionQuarter, PartitionEighth}
+	tierIdx := 0
+	prevCount := 1
 
-	// Quarter: same proportional subdivision as eighth on this hardware.
-	// On systems where PCIe roots group multiple devices (e.g., 2 GPUs per switch),
-	// quarter would have fewer, larger partitions than eighth.
-	quarterGroups := b.buildProportionalPartitions(nodeName, profile, PartitionQuarter, byNUMA, byPCIeRoot, allDevices)
-	result.Partitions = append(result.Partitions, quarterGroups...)
+	socketCount := countNonEmptyGroups(bySocket)
+	numaCount := countNonEmptyGroups(byNUMA)
 
-	// Half: one partition per socket
-	halves := b.buildPartitionsFromGroups(nodeName, profile, PartitionHalf, bySocket, groupingRules)
-	result.Partitions = append(result.Partitions, halves...)
+	// Determine which tier label each boundary gets
+	socketTier := PartitionType("")
+	numaTier := PartitionType("")
+	pcieTier := PartitionType("")
 
-	// Full: all devices on the node
+	if socketCount > prevCount && tierIdx < len(tiers) {
+		socketTier = tiers[tierIdx]
+		prevCount = socketCount
+		tierIdx++
+	}
+	if numaCount > prevCount && tierIdx < len(tiers) {
+		numaTier = tiers[tierIdx]
+		prevCount = numaCount
+		tierIdx++
+	}
+	if tierIdx < len(tiers) {
+		pcieTier = tiers[tierIdx]
+	}
+
+	// Build finest-grained first, coarsest last (matches prior order)
+	if pcieTier != "" {
+		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, byPCIeRoot, allDevices)
+		result.Partitions = append(result.Partitions, p...)
+	}
+
+	if numaTier != "" {
+		p := b.buildPartitionsFromGroups(nodeName, profile, numaTier, byNUMA, groupingRules)
+		result.Partitions = append(result.Partitions, p...)
+	}
+
+	if socketTier != "" {
+		p := b.buildPartitionsFromGroups(nodeName, profile, socketTier, bySocket, groupingRules)
+		result.Partitions = append(result.Partitions, p...)
+	}
+
 	full := b.buildFullPartition(nodeName, profile, allDevices, groupingRules)
 	if full != nil {
 		result.Partitions = append(result.Partitions, *full)
 	}
 
+	tierCounts := make(map[PartitionType]int)
+	for _, p := range result.Partitions {
+		tierCounts[p.Type]++
+	}
 	klog.Infof("Node %s (profile=%s): computed %d partitions (%d eighth, %d quarter, %d half, %d full)",
-		nodeName, profile,
-		len(result.Partitions),
-		len(eighths), len(quarterGroups), len(halves),
-		boolToInt(full != nil))
+		nodeName, profile, len(result.Partitions),
+		tierCounts[PartitionEighth], tierCounts[PartitionQuarter],
+		tierCounts[PartitionHalf], tierCounts[PartitionFull])
 
 	return result
 }
@@ -531,6 +562,16 @@ func baseDriverName(driverName string) string {
 		return driverName[:idx]
 	}
 	return driverName
+}
+
+func countNonEmptyGroups(groups map[string][]TopologyDevice) int {
+	count := 0
+	for key := range groups {
+		if key != "" {
+			count++
+		}
+	}
+	return count
 }
 
 func boolToInt(b bool) int {
