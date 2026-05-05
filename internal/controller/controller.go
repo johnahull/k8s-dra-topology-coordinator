@@ -34,6 +34,10 @@ type Controller struct {
 	partitionBuilder *PartitionBuilder
 	classManager     *DeviceClassManager
 
+	// synced is set after informer caches are synced and initial reconcile completes.
+	// Event handlers skip enqueueing reconciles until this is true.
+	synced bool
+
 	// workqueue triggers a full reconciliation when topology changes
 	workqueue workqueue.TypedRateLimitingInterface[string]
 }
@@ -107,11 +111,28 @@ func (c *Controller) Run(ctx context.Context) error {
 	}
 	klog.Info("Informer caches synced")
 
+	// Build the model from the complete informer store to avoid
+	// partial state from event handlers during startup.
+	for _, obj := range sliceInformer.GetStore().List() {
+		if slice, ok := obj.(*resourcev1.ResourceSlice); ok {
+			c.model.UpdateFromResourceSlice(slice)
+		}
+	}
+	for _, obj := range cmInformer.GetStore().List() {
+		if cm, ok := obj.(*corev1.ConfigMap); ok {
+			if err := c.ruleStore.LoadFromConfigMap(cm); err != nil {
+				klog.Warningf("Failed to load topology rule from %s: %v", cm.Name, err)
+			}
+		}
+	}
+	c.model.SetRules(c.ruleStore.GetRules())
+
 	// Run reconciliation loop
 	go c.runWorker(ctx)
 
 	// Trigger initial reconciliation
 	c.workqueue.Add("reconcile")
+	c.synced = true
 
 	<-ctx.Done()
 	c.workqueue.ShutDown()
@@ -172,7 +193,9 @@ func (c *Controller) onSliceAdd(obj interface{}) {
 		return
 	}
 	c.model.UpdateFromResourceSlice(slice)
-	c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	if c.synced {
+		c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	}
 }
 
 // onSliceUpdate handles a ResourceSlice update.
@@ -182,7 +205,9 @@ func (c *Controller) onSliceUpdate(_, newObj interface{}) {
 		return
 	}
 	c.model.UpdateFromResourceSlice(slice)
-	c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	if c.synced {
+		c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	}
 }
 
 // onSliceDelete handles a ResourceSlice deletion.

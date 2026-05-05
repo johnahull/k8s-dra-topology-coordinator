@@ -366,24 +366,30 @@ func (b *PartitionBuilder) buildProportionalPartitions( //nolint:unparam
 			p.DeviceCapacity = make(map[string]map[string]string)
 			for driver, count := range driverCounts {
 				divided := count / subdivisions
-				if divided == 0 {
-					divided = 1 // shared devices get count=1 per partition
-					// For shared devices, compute capacity per partition
-					// by dividing total capacity by number of subdivisions
+
+				// Use capacity mode when there aren't enough devices for
+				// exclusive allocation (count < subdivisions) AND devices
+				// publish consumable capacity. This lets multiple partitions
+				// share the same device (e.g., CPU, memory).
+				if count < subdivisions {
 					for _, d := range devices {
 						if baseDriverName(d.DriverName) == driver && len(d.Capacity) > 0 {
 							capPerPartition := make(map[string]string)
 							for capName, capVal := range d.Capacity {
-								divided := divideQuantity(capVal, subdivisions)
-								if divided != "" {
-									capPerPartition[capName] = divided
+								dv := divideQuantity(capVal, subdivisions)
+								if dv != "" {
+									capPerPartition[capName] = dv
 								}
 							}
 							if len(capPerPartition) > 0 {
 								p.DeviceCapacity[driver] = capPerPartition
+								divided = 1
 							}
-							break // use first device's capacity as representative
+							break
 						}
+					}
+					if divided == 0 {
+						divided = 1
 					}
 				}
 				p.DeviceCounts[driver] = divided
@@ -476,12 +482,14 @@ func buildPartitionFromDevices(
 	return p
 }
 
-// inferProfile attempts to identify the hardware profile from device counts and driver names.
+// inferProfile identifies the hardware profile from driver names only.
+// Device counts are excluded to keep the profile (and DeviceClass names)
+// stable across transient device count changes from driver restarts or
+// allocation events.
 func (b *PartitionBuilder) inferProfile(driverDeviceCounts map[string]int) string {
-	// Build a simple profile string from driver names and counts
 	var parts []string
-	for driver, count := range driverDeviceCounts {
-		parts = append(parts, fmt.Sprintf("%s-%d", driver, count))
+	for driver := range driverDeviceCounts {
+		parts = append(parts, driver)
 	}
 	sort.Strings(parts)
 	if len(parts) == 0 {
