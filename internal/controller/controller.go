@@ -31,7 +31,9 @@ type Controller struct {
 
 	model            *TopologyModel
 	ruleStore        *TopologyRuleStore
+	groupingStore    *GroupingStore
 	partitionBuilder *PartitionBuilder
+	groupingBuilder  *GroupingBuilder
 	classManager     *DeviceClassManager
 
 	// synced is set after informer caches are synced and initial reconcile completes.
@@ -50,13 +52,16 @@ func NewController(client kubernetes.Interface, driverName string) *Controller {
 
 	model := NewTopologyModel()
 	ruleStore := NewTopologyRuleStore()
+	groupingStore := NewGroupingStore()
 
 	return &Controller{
 		client:           client,
 		driverName:       driverName,
 		model:            model,
 		ruleStore:        ruleStore,
+		groupingStore:    groupingStore,
 		partitionBuilder: NewPartitionBuilder(model, ruleStore),
+		groupingBuilder:  NewGroupingBuilder(model, ruleStore),
 		classManager:     NewDeviceClassManager(client, driverName, ruleStore),
 		workqueue:        workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]()),
 	}
@@ -81,6 +86,13 @@ func (c *Controller) Run(ctx context.Context) error {
 		}),
 	)
 
+	// Filtered factory for ConfigMaps with the device-grouping label
+	groupingCMFactory := informers.NewSharedInformerFactoryWithOptions(c.client, defaultResyncPeriod,
+		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			opts.LabelSelector = DeviceGroupingLabel + "=true"
+		}),
+	)
+
 	// Watch ResourceSlices from ALL drivers
 	sliceInformer := factory.Resource().V1().ResourceSlices().Informer()
 	if _, err := sliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -101,12 +113,23 @@ func (c *Controller) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to add ConfigMap event handler: %w", err)
 	}
 
+	// Watch ConfigMaps with the device-grouping label
+	groupingCMInformer := groupingCMFactory.Core().V1().ConfigMaps().Informer()
+	if _, err := groupingCMInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.onGroupingConfigMapAdd,
+		UpdateFunc: c.onGroupingConfigMapUpdate,
+		DeleteFunc: c.onGroupingConfigMapDelete,
+	}); err != nil {
+		return fmt.Errorf("failed to add grouping ConfigMap event handler: %w", err)
+	}
+
 	// Start informers
 	factory.Start(ctx.Done())
 	cmFactory.Start(ctx.Done())
+	groupingCMFactory.Start(ctx.Done())
 
 	// Wait for cache sync
-	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, cmInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), sliceInformer.HasSynced, cmInformer.HasSynced, groupingCMInformer.HasSynced) {
 		return fmt.Errorf("failed to sync informer caches")
 	}
 	klog.Info("Informer caches synced")
@@ -126,6 +149,15 @@ func (c *Controller) Run(ctx context.Context) error {
 		}
 	}
 	c.model.SetRules(c.ruleStore.GetRules())
+
+	// Load device grouping ConfigMaps
+	for _, obj := range groupingCMInformer.GetStore().List() {
+		if cm, ok := obj.(*corev1.ConfigMap); ok {
+			if err := c.groupingStore.LoadFromConfigMap(cm); err != nil {
+				klog.Warningf("Failed to load device grouping from %s: %v", cm.Name, err)
+			}
+		}
+	}
 
 	// Run reconciliation loop
 	go c.runWorker(ctx)
@@ -168,21 +200,40 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	c.model.SetRules(rules)
 	metrics.TopologyRulesTotal.Set(float64(len(rules)))
 
-	// Build partitions from the current topology
-	results := c.partitionBuilder.BuildPartitions()
+	groupings := c.groupingStore.GetGroupings()
 
-	// Sync DeviceClasses
-	if err := c.classManager.SyncDeviceClasses(ctx, results); err != nil {
-		metrics.ReconciliationErrors.Inc()
-		return fmt.Errorf("failed to sync DeviceClasses: %w", err)
+	if len(groupings) > 0 {
+		// Grouping-based path: validate admin-defined groupings against topology
+		groupingResults := c.groupingBuilder.BuildGroupings(groupings)
+
+		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
+		}
+
+		metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
+		metrics.NodesTotal.Set(float64(len(groupingResults)))
+		metrics.DeviceClassesTotal.Set(float64(countGroupingDeviceClasses(groupingResults)))
+
+		klog.Infof("Reconciliation complete (groupings): %d nodes, %d grouping DeviceClasses",
+			len(groupingResults), countGroupingDeviceClasses(groupingResults))
+	} else {
+		// Legacy partition path: auto-discover partitions from topology
+		results := c.partitionBuilder.BuildPartitions()
+
+		if err := c.classManager.SyncDeviceClasses(ctx, results); err != nil {
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("failed to sync DeviceClasses: %w", err)
+		}
+
+		metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
+		metrics.NodesTotal.Set(float64(len(results)))
+		metrics.DeviceClassesTotal.Set(float64(countDeviceClasses(results)))
+
+		klog.Infof("Reconciliation complete (partitions): %d nodes, %d DeviceClasses",
+			len(results), countDeviceClasses(results))
 	}
 
-	metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
-	metrics.NodesTotal.Set(float64(len(results)))
-	metrics.DeviceClassesTotal.Set(float64(countDeviceClasses(results)))
-
-	klog.Infof("Reconciliation complete: %d nodes, %d DeviceClasses",
-		len(results), countDeviceClasses(results))
 	return nil
 }
 
@@ -277,6 +328,72 @@ func (c *Controller) onConfigMapDelete(obj interface{}) {
 	}
 	c.ruleStore.RemoveConfigMap(cm.Namespace, cm.Name)
 	c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+}
+
+// onGroupingConfigMapAdd handles a new grouping ConfigMap.
+func (c *Controller) onGroupingConfigMapAdd(obj interface{}) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		return
+	}
+	if cm.Labels[DeviceGroupingLabel] != "true" {
+		return
+	}
+	if err := c.groupingStore.LoadFromConfigMap(cm); err != nil {
+		klog.Errorf("Failed to load device grouping from %s/%s: %v", cm.Namespace, cm.Name, err)
+		return
+	}
+	if c.synced {
+		c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	}
+}
+
+// onGroupingConfigMapUpdate handles a grouping ConfigMap update.
+func (c *Controller) onGroupingConfigMapUpdate(_, newObj interface{}) {
+	cm, ok := newObj.(*corev1.ConfigMap)
+	if !ok {
+		return
+	}
+	if cm.Labels[DeviceGroupingLabel] != "true" {
+		return
+	}
+	if err := c.groupingStore.LoadFromConfigMap(cm); err != nil {
+		klog.Errorf("Failed to update device grouping from %s/%s: %v", cm.Namespace, cm.Name, err)
+		return
+	}
+	if c.synced {
+		c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+	}
+}
+
+// onGroupingConfigMapDelete handles a grouping ConfigMap deletion.
+func (c *Controller) onGroupingConfigMapDelete(obj interface{}) {
+	cm, ok := obj.(*corev1.ConfigMap)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			return
+		}
+		cm, ok = tombstone.Obj.(*corev1.ConfigMap)
+		if !ok {
+			return
+		}
+	}
+	if cm.Labels[DeviceGroupingLabel] != "true" {
+		return
+	}
+	c.groupingStore.RemoveConfigMap(cm.Namespace, cm.Name)
+	c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+}
+
+func countGroupingDeviceClasses(results []GroupingResult) int {
+	seen := make(map[string]bool)
+	for _, r := range results {
+		for _, inst := range r.Instances {
+			seen[inst.GroupingName+"-"+inst.Alignment] = true
+		}
+	}
+	return len(seen)
 }
 
 func countDeviceClasses(results []PartitionResult) int {

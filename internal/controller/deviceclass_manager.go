@@ -487,6 +487,278 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 	return false
 }
 
+// SyncGroupingDeviceClasses creates or updates DeviceClass objects for each
+// satisfiable grouping instance discovered across all nodes.
+func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, results []GroupingResult) error {
+	type groupingKey struct {
+		groupingName string
+		alignment    string
+		numaKey      string
+	}
+
+	type groupingEntry struct {
+		representative GroupingInstance
+		config         PartitionConfig
+		count          int
+	}
+
+	seen := make(map[string]*groupingEntry)
+	for _, result := range results {
+		for _, inst := range result.Instances {
+			config := m.buildGroupingConfig(inst)
+
+			nk := numaKey(inst.NUMANodes)
+			key := inst.GroupingName + "-" + sanitizeForName(inst.Alignment)
+			if nk != "" {
+				key += "-numa" + nk
+			}
+
+			if entry, ok := seen[key]; ok {
+				entry.count++
+			} else {
+				seen[key] = &groupingEntry{
+					representative: inst,
+					config:         config,
+					count:          1,
+				}
+			}
+		}
+	}
+
+	for key, entry := range seen {
+		dc := m.buildGroupingDeviceClass(key, entry.representative, entry.config, entry.count)
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	activeKeys := make(map[string]bool, len(seen))
+	for key := range seen {
+		activeKeys[key] = true
+	}
+	if err := m.cleanupStaleGroupingDeviceClasses(ctx, activeKeys); err != nil {
+		klog.Errorf("Failed to cleanup stale grouping DeviceClasses: %v", err)
+	}
+
+	klog.Infof("Synced %d grouping DeviceClasses", len(seen))
+	return nil
+}
+
+// buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.
+func (m *DeviceClassManager) buildGroupingConfig(inst GroupingInstance) PartitionConfig {
+	config := PartitionConfig{
+		Kind: "PartitionConfig",
+	}
+
+	for driverClass, count := range inst.DeviceCounts {
+		sr := SubResourceConfig{
+			DeviceClass: driverClass,
+			Count:       count,
+		}
+
+		if cap, ok := inst.DeviceCapacity[driverClass]; ok {
+			sr.Capacity = cap
+		}
+
+		// Per-driver NUMA CEL selectors
+		if len(inst.NUMANodes) > 0 {
+			// Find the driver name for this device class to look up NUMA attribute
+			driver := m.driverForClass(driverClass)
+			if attr, ok := m.rules.GetNUMAAttributeForDriver(driver); ok {
+				if !strings.Contains(attr, "/") {
+					attr = driver + "/" + attr
+				}
+				cel := BuildNUMACELSelector(attr, inst.NUMANodes)
+				if cel != "" {
+					sr.Selectors = append(sr.Selectors, cel)
+				}
+			} else {
+				cel := BuildNUMACELSelector(AttrNUMANode, inst.NUMANodes)
+				if cel != "" {
+					sr.Selectors = append(sr.Selectors, cel)
+				}
+			}
+		}
+
+		config.SubResources = append(config.SubResources, sr)
+	}
+
+	// Alignment constraints from topology rules (same logic as partition path)
+	matchRules := m.rules.GetMatchConstraintRules()
+	for _, rule := range matchRules {
+		if _, ok := inst.DeviceCounts[m.rules.GetDeviceClassForDriver(rule.Driver)]; !ok {
+			continue
+		}
+
+		var constraintRequests []string
+		if len(inst.Devices) > 0 {
+			driversWithAttribute := make(map[string]bool)
+			for _, dev := range inst.Devices {
+				val := deviceAttributeValueString(dev, rule.Attribute)
+				if val != "" {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range inst.DeviceCounts {
+				rawDriver := m.driverForClass(driver)
+				if driversWithAttribute[baseDriverName(rawDriver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+		}
+
+		if len(constraintRequests) < 2 {
+			continue
+		}
+
+		enforcement := rule.Enforcement
+		if enforcement == "" {
+			enforcement = EnforcementRequired
+		}
+
+		config.Alignments = append(config.Alignments, AlignmentConfig{
+			Attribute:   rule.Attribute,
+			Requests:    constraintRequests,
+			Enforcement: enforcement,
+		})
+	}
+
+	return config
+}
+
+// buildGroupingDeviceClass constructs a DeviceClass for a grouping instance.
+func (m *DeviceClassManager) buildGroupingDeviceClass(
+	key string,
+	representative GroupingInstance,
+	config PartitionConfig,
+	count int,
+) *resourcev1.DeviceClass {
+	name := sanitizeDNSLabel(key)
+
+	celExpr := fmt.Sprintf(
+		`device.driver == %q && device.attributes[%q].grouping == %q`,
+		m.driverName, m.driverName, representative.GroupingName,
+	)
+
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		klog.Errorf("Failed to marshal grouping config: %v", err)
+		configJSON = []byte("{}")
+	}
+
+	labels := map[string]string{
+		CoordinatorDriverName + "/managed":   "true",
+		CoordinatorDriverName + "/grouping":  truncateLabel(representative.GroupingName),
+		CoordinatorDriverName + "/alignment": representative.Alignment,
+	}
+	if len(representative.NUMANodes) > 0 {
+		labels[CoordinatorDriverName+"/numa"] = numaKey(representative.NUMANodes)
+	}
+	if count > 1 {
+		labels[CoordinatorDriverName+"/count"] = fmt.Sprintf("%d", count)
+	}
+
+	return &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   name,
+			Labels: labels,
+		},
+		Spec: resourcev1.DeviceClassSpec{
+			Selectors: []resourcev1.DeviceSelector{
+				{
+					CEL: &resourcev1.CELDeviceSelector{
+						Expression: celExpr,
+					},
+				},
+			},
+			Config: []resourcev1.DeviceClassConfiguration{
+				{
+					DeviceConfiguration: resourcev1.DeviceConfiguration{
+						Opaque: &resourcev1.OpaqueDeviceConfiguration{
+							Driver:     m.driverName,
+							Parameters: runtime.RawExtension{Raw: configJSON},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// cleanupStaleGroupingDeviceClasses removes grouping DeviceClasses that no longer match.
+func (m *DeviceClassManager) cleanupStaleGroupingDeviceClasses(ctx context.Context, active map[string]bool) error {
+	labelSelector := fmt.Sprintf("%s/managed=true,%s/grouping", CoordinatorDriverName, CoordinatorDriverName)
+	classes, err := m.client.ResourceV1().DeviceClasses().List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list grouping DeviceClasses: %w", err)
+	}
+
+	for _, dc := range classes.Items {
+		grouping := dc.Labels[CoordinatorDriverName+"/grouping"]
+		alignment := dc.Labels[CoordinatorDriverName+"/alignment"]
+		numa := dc.Labels[CoordinatorDriverName+"/numa"]
+
+		key := grouping + "-" + sanitizeForName(alignment)
+		if numa != "" {
+			key += "-numa" + numa
+		}
+
+		if _, exists := active[key]; !exists {
+			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
+				if !errors.IsNotFound(err) {
+					klog.Errorf("Failed to delete stale grouping DeviceClass %s: %v", dc.Name, err)
+				}
+			} else {
+				klog.Infof("Deleted stale grouping DeviceClass %s", dc.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// driverForClass returns the raw driver name for a DeviceClass name.
+// If a topology rule overrides the class name, this reverse-maps it.
+func (m *DeviceClassManager) driverForClass(className string) string {
+	for _, rule := range m.rules.GetRules() {
+		if rule.DeviceClass == className {
+			return rule.Driver
+		}
+	}
+	return className
+}
+
+// sanitizeDNSLabel converts a string to a valid DNS label (max 63 chars).
+func sanitizeDNSLabel(s string) string {
+	sanitized := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return '-'
+	}, s)
+
+	for strings.Contains(sanitized, "--") {
+		sanitized = strings.ReplaceAll(sanitized, "--", "-")
+	}
+	sanitized = strings.Trim(sanitized, "-")
+
+	if sanitized == "" {
+		sanitized = "default"
+	}
+
+	if len(sanitized) > 63 {
+		h := sha256.Sum256([]byte(sanitized))
+		hash := hex.EncodeToString(h[:4])
+		sanitized = sanitized[:54] + "-" + hash
+	}
+
+	return sanitized
+}
+
 // publishDeviceClass creates or updates a DeviceClass.
 func (m *DeviceClassManager) publishDeviceClass(ctx context.Context, dc *resourcev1.DeviceClass) error {
 	existing, err := m.client.ResourceV1().DeviceClasses().Get(ctx, dc.Name, metav1.GetOptions{})
