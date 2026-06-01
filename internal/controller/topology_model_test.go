@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -580,4 +581,161 @@ func TestTopologyModel_RemoveSliceCleansRawData(t *testing.T) {
 	// After removing and re-setting rules, the device should not reappear
 	model.SetRules([]TopologyRule{})
 	assert.Nil(t, model.GetNodeTopology("node-1"), "removed slices should not reappear after SetRules")
+}
+
+func TestTopologyModel_SharedCountersSlice(t *testing.T) {
+	model := NewTopologyModel()
+
+	// Add a SharedCounters-only slice (no devices)
+	counterSlice := &resourcev1.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "counter-slice"},
+		Spec: resourcev1.ResourceSliceSpec{
+			Driver:   "gpu.amd.com",
+			NodeName: strPtr("node-1"),
+			Pool: resourcev1.ResourcePool{
+				Name:               "gpu-pool",
+				Generation:         1,
+				ResourceSliceCount: 2,
+			},
+			SharedCounters: []resourcev1.CounterSet{
+				{
+					Name: "gpu-0-counters",
+					Counters: map[string]resourcev1.Counter{
+						"xcds":   {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+						"memory": {Value: *resource.NewQuantity(288, resource.DecimalSI)},
+					},
+				},
+			},
+		},
+	}
+	model.UpdateFromResourceSlice(counterSlice)
+
+	nodeTopo := model.GetNodeTopology("node-1")
+	require.NotNil(t, nodeTopo)
+
+	// No devices in this slice
+	assert.Empty(t, nodeTopo.AllDevices())
+
+	// But SharedCounters should be stored
+	require.NotEmpty(t, nodeTopo.SharedCounters)
+	infos := nodeTopo.SharedCounters["counter-slice"]
+	require.Len(t, infos, 1)
+	assert.Equal(t, "gpu-0-counters", infos[0].CounterSet.Name)
+	assert.Equal(t, "gpu.amd.com", infos[0].DriverName)
+}
+
+func TestTopologyModel_ConsumesCountersExtracted(t *testing.T) {
+	model := NewTopologyModel()
+
+	// Add a device slice with ConsumesCounters
+	deviceSlice := makeResourceSlice("device-slice", "gpu.amd.com", "node-1", "gpu-pool", []resourcev1.Device{
+		{
+			Name: "gpu-0-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{
+					CounterSet: "gpu-0-counters",
+					Counters: map[string]resourcev1.Counter{
+						"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+					},
+				},
+			},
+		},
+	})
+	model.UpdateFromResourceSlice(deviceSlice)
+
+	nodeTopo := model.GetNodeTopology("node-1")
+	require.NotNil(t, nodeTopo)
+
+	devices := nodeTopo.AllDevices()
+	require.Len(t, devices, 1)
+	require.Len(t, devices[0].ConsumesCounters, 1)
+	assert.Equal(t, "gpu-0-counters", devices[0].ConsumesCounters[0].CounterSet)
+}
+
+func TestTopologyModel_RemoveSharedCountersSlice(t *testing.T) {
+	model := NewTopologyModel()
+
+	counterSlice := &resourcev1.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "counter-slice"},
+		Spec: resourcev1.ResourceSliceSpec{
+			Driver:   "gpu.amd.com",
+			NodeName: strPtr("node-1"),
+			Pool: resourcev1.ResourcePool{
+				Name:               "gpu-pool",
+				Generation:         1,
+				ResourceSliceCount: 1,
+			},
+			SharedCounters: []resourcev1.CounterSet{
+				{Name: "gpu-0-counters"},
+			},
+		},
+	}
+	model.UpdateFromResourceSlice(counterSlice)
+	require.NotNil(t, model.GetNodeTopology("node-1"))
+
+	model.RemoveResourceSlice(counterSlice)
+	assert.Nil(t, model.GetNodeTopology("node-1"), "node should be cleaned up when only SharedCounters slice is removed")
+}
+
+func TestTopologyModel_IsConstraintSatisfiable_WithOverlappingDevices(t *testing.T) {
+	model := NewTopologyModel()
+
+	// Add partitionable GPU devices — 1 physical GPU advertised as 3 devices
+	gpuSlice := makeResourceSlice("gpu-slice", "gpu.amd.com", "node-1", "gpu-pool", []resourcev1.Device{
+		{
+			Name: "gpu-0-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-1",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+	})
+	model.UpdateFromResourceSlice(gpuSlice)
+
+	// Add a NIC on same NUMA
+	nicSlice := makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	})
+	model.UpdateFromResourceSlice(nicSlice)
+
+	// 1 GPU + 1 NIC on same NUMA should be satisfiable (1 physical GPU)
+	assert.True(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.amd.com":       1,
+		"rdma.mellanox.com": 1,
+	}))
+
+	// 2 GPUs on same NUMA should NOT be satisfiable (only 1 physical GPU)
+	assert.False(t, model.IsConstraintSatisfiable(AttrNUMANode, map[string]int{
+		"gpu.amd.com": 2,
+	}))
 }

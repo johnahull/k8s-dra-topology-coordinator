@@ -215,13 +215,15 @@ func (s *TopologyRuleStore) GetDeviceClassForDriver(driverName string) string {
 
 // BuildNUMACELSelector generates a CEL expression that pins devices from a
 // specific driver to the given NUMA node value(s), using the driver's own
-// attribute namespace. For example:
+// attribute namespace. Uses includes() for list-type attribute compatibility
+// (DRAListTypeAttributes feature gate). includes() works with both scalar
+// and list-type attributes. For example:
 //
-//	attribute="gpu.amd.com/numaNode", values=[0]
-//	→ device.attributes["gpu.amd.com"].numaNode == 0
+//	attribute="resource.kubernetes.io/numaNode", values=[0]
+//	→ device.attributes["resource.kubernetes.io"].numaNode.includes(0)
 //
-//	attribute="dra.cpu/numaNodeID", values=[0, 1]
-//	→ device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1
+//	attribute="resource.kubernetes.io/numaNode", values=[0, 1]
+//	→ device.attributes["resource.kubernetes.io"].numaNode.includes(0) || ...includes(1)
 func BuildNUMACELSelector(attribute string, numaValues []int64) string {
 	parts := strings.SplitN(attribute, "/", 2)
 	if len(parts) != 2 {
@@ -234,13 +236,13 @@ func BuildNUMACELSelector(attribute string, numaValues []int64) string {
 	hasGuard := fmt.Sprintf(`has(%s)`, attrRef)
 
 	if len(numaValues) == 1 {
-		return fmt.Sprintf(`%s && %s == %d`, hasGuard, attrRef, numaValues[0])
+		return fmt.Sprintf(`%s && %s.includes(%d)`, hasGuard, attrRef, numaValues[0])
 	}
 
-	// Multiple NUMA values: has() && (v1 || v2 || ...)
+	// Multiple NUMA values: has() && (includes(v1) || includes(v2) || ...)
 	var clauses []string
 	for _, v := range numaValues {
-		clauses = append(clauses, fmt.Sprintf(`%s == %d`, attrRef, v))
+		clauses = append(clauses, fmt.Sprintf(`%s.includes(%d)`, attrRef, v))
 	}
 	return fmt.Sprintf(`%s && (%s)`, hasGuard, strings.Join(clauses, " || "))
 }

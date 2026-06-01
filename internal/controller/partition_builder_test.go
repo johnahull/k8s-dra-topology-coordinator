@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // buildHGXB200Topology populates a topology model with an HGX B200-like node:
@@ -343,6 +344,153 @@ func TestPartitionBuilder_TopologyRecomputation(t *testing.T) {
 	newPartitionCount := len(results[0].Partitions)
 	assert.Greater(t, newPartitionCount, initialPartitionCount,
 		"adding a device on a new NUMA node should increase partition count")
+}
+
+// buildMI355XPartitionableTopology populates a model with 2 AMD MI355X GPUs
+// on NUMA 0, each advertised as SPX + 2 DPX = 3 devices (6 total for 2 physical GPUs),
+// plus 2 NICs on NUMA 0.
+func buildMI355XPartitionableTopology(model *TopologyModel) {
+	gpuDevices := []resourcev1.Device{
+		// GPU 0: SPX + 2 DPX
+		{
+			Name: "gpu-0-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-0-dpx-1",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-0")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-0-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		// GPU 1: SPX + 2 DPX
+		{
+			Name: "gpu-1-spx",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(8, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-1-dpx-0",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+		{
+			Name: "gpu-1-dpx-1",
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				resourcev1.QualifiedName(AttrNUMANode): {IntValue: intPtr(0)},
+				resourcev1.QualifiedName(AttrPCIeRoot): {StringValue: strPtr("pcie-1")},
+				resourcev1.QualifiedName(AttrSocket):   {IntValue: intPtr(0)},
+			},
+			ConsumesCounters: []resourcev1.DeviceCounterConsumption{
+				{CounterSet: "gpu-1-counters", Counters: map[string]resourcev1.Counter{
+					"xcds": {Value: *resource.NewQuantity(4, resource.DecimalSI)},
+				}},
+			},
+		},
+	}
+	gpuSlice := makeResourceSlice("gpu-slice", "gpu.amd.com", "node-1", "gpu-pool", gpuDevices)
+	model.UpdateFromResourceSlice(gpuSlice)
+
+	// 2 NICs on same NUMA, different PCIe roots
+	nicDevices := []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+		makeNICDevice("nic-1", 0, "pcie-1"),
+	}
+	nicSlice := makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", nicDevices)
+	model.UpdateFromResourceSlice(nicSlice)
+}
+
+func TestPartitionBuilder_PartitionableDevices(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	buildMI355XPartitionableTopology(model)
+
+	results := builder.BuildPartitions()
+	require.Len(t, results, 1)
+
+	result := results[0]
+
+	// The full partition should report 2 effective GPUs, not 6
+	for _, p := range result.Partitions {
+		if p.Type == PartitionFull {
+			gpuCount := p.DeviceCounts["gpu.amd.com"]
+			assert.Equal(t, 2, gpuCount,
+				"full partition should have 2 effective GPUs (not 6 advertised)")
+			nicCount := p.DeviceCounts["rdma.mellanox.com"]
+			assert.Equal(t, 2, nicCount,
+				"full partition should have 2 NICs")
+		}
+	}
+}
+
+func TestPartitionBuilder_PartitionableDevicesEighths(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	builder := NewPartitionBuilder(model, rules)
+
+	buildMI355XPartitionableTopology(model)
+
+	results := builder.BuildPartitions()
+	require.Len(t, results, 1)
+
+	// With 2 GPUs on 2 PCIe roots on 1 NUMA, eighth partitions should
+	// each have 1 effective GPU + 1 NIC
+	for _, p := range results[0].Partitions {
+		if p.Type == PartitionEighth {
+			gpuCount := p.DeviceCounts["gpu.amd.com"]
+			assert.Equal(t, 1, gpuCount,
+				"eighth partition %s should have 1 effective GPU", p.Name)
+			nicCount := p.DeviceCounts["rdma.mellanox.com"]
+			assert.Equal(t, 1, nicCount,
+				"eighth partition %s should have 1 NIC", p.Name)
+		}
+	}
 }
 
 func TestBaseDriverName(t *testing.T) {

@@ -117,7 +117,7 @@ func TestIntegration_ControllerCreatesDeviceClasses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io")
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeAuto)
 	go func() {
 		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("controller failed: %v", err)
@@ -166,7 +166,7 @@ func TestIntegration_DeviceClassCleanup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io")
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeAuto)
 	go func() {
 		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("controller failed: %v", err)
@@ -221,7 +221,7 @@ func TestIntegration_TopologyRulesFromConfigMap(t *testing.T) {
 		t.Logf("namespace creation: %v", err)
 	}
 
-	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io")
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeAuto)
 	go func() {
 		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("controller failed: %v", err)
@@ -328,7 +328,7 @@ func TestIntegration_MultipleNodesMultipleDrivers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io")
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeAuto)
 	go func() {
 		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("controller failed: %v", err)
@@ -375,7 +375,7 @@ func TestIntegration_DriverSpecificAttributeMapping(t *testing.T) {
 		t.Logf("namespace creation: %v", err)
 	}
 
-	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io")
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeAuto)
 	go func() {
 		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
 			t.Errorf("controller failed: %v", err)
@@ -462,4 +462,107 @@ func TestIntegration_DriverSpecificAttributeMapping(t *testing.T) {
 		}
 	}
 	assert.True(t, foundPartitionType, "expected partitionType label on DeviceClass")
+}
+
+func TestValidPartitionMode(t *testing.T) {
+	tests := []struct {
+		mode string
+		want bool
+	}{
+		{"auto", true},
+		{"partitions", true},
+		{"groupings", true},
+		{"", false},
+		{"invalid", false},
+		{"PARTITIONS", false},
+		{"Auto", false},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("mode=%q", tt.mode), func(t *testing.T) {
+			assert.Equal(t, tt.want, controller.ValidPartitionMode(tt.mode))
+		})
+	}
+}
+
+func TestIntegration_PartitionModePartitionsIgnoresGroupings(t *testing.T) {
+	client, teardown := setupEnvtest(t)
+	defer teardown()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	_, err := client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Logf("namespace creation: %v", err)
+	}
+
+	// Create a device grouping ConfigMap (should be ignored in partitions mode)
+	_, err = client.CoreV1().ConfigMaps("default").Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-nic-pair",
+			Namespace: "default",
+			Labels:    map[string]string{"nodepartition.dra.k8s.io/device-grouping": "true"},
+		},
+		Data: map[string]string{
+			"name":      "gpu-nic-pair",
+			"alignment": "pcieRoot",
+			"devices":   "- class: gpu.nvidia.com\n  count: 1\n- class: rdma.mellanox.com\n  count: 1\n",
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModePartitions)
+	go func() {
+		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Errorf("controller failed: %v", err)
+		}
+	}()
+
+	createResourceSlice(t, ctx, client, "gpu-slice-pm", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 1, "pcie-1"),
+	})
+
+	classes := waitForDeviceClasses(t, ctx, client, 1)
+
+	// In partitions mode, DeviceClasses should have partitionType labels (old model)
+	foundPartitionType := false
+	for _, dc := range classes {
+		if pt := dc.Labels["nodepartition.dra.k8s.io/partitionType"]; pt != "" {
+			foundPartitionType = true
+		}
+	}
+	assert.True(t, foundPartitionType, "partitions mode should produce partition-style DeviceClasses")
+}
+
+func TestIntegration_PartitionModeGroupingsNoConfigMaps(t *testing.T) {
+	client, teardown := setupEnvtest(t)
+	defer teardown()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ctrl := controller.NewController(client, "nodepartition.dra.k8s.io", controller.PartitionModeGroupings)
+	go func() {
+		if err := ctrl.Run(ctx); err != nil && ctx.Err() == nil {
+			t.Errorf("controller failed: %v", err)
+		}
+	}()
+
+	createResourceSlice(t, ctx, client, "gpu-slice-gm", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 1, "pcie-1"),
+	})
+
+	// Give the controller time to reconcile
+	time.Sleep(5 * time.Second)
+
+	// With groupings mode and no ConfigMaps, no DeviceClasses should be created
+	classes, err := client.ResourceV1().DeviceClasses().List(ctx, metav1.ListOptions{
+		LabelSelector: "nodepartition.dra.k8s.io/managed=true",
+	})
+	require.NoError(t, err)
+	assert.Empty(t, classes.Items, "groupings mode with no ConfigMaps should produce zero DeviceClasses")
 }

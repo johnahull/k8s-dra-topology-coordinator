@@ -52,9 +52,10 @@ type TopologyDevice struct {
 	PoolName string
 
 	// Standard topology attributes
-	NUMANode *int64
-	PCIeRoot *string
-	Socket   *int64
+	NUMANode  *int64  // Primary NUMA node (first element of NUMANodes, or scalar value)
+	NUMANodes []int64 // Full NUMA node list from IntValues (SLIT-aware, physical first)
+	PCIeRoot  *string
+	Socket    *int64
 
 	// Extended attributes from topology rules (attribute qualified name -> value).
 	ExtendedAttributes map[string]DeviceAttributeValue
@@ -62,6 +63,11 @@ type TopologyDevice struct {
 	// Capacity holds consumable capacity from the ResourceSlice device.
 	// Key is the capacity name, value is the total quantity string.
 	Capacity map[string]string
+
+	// ConsumesCounters records which shared counter sets this device draws from.
+	// Devices referencing the same CounterSet are overlapping partitions of the
+	// same physical resource (KEP-4815 partitionable devices).
+	ConsumesCounters []resourcev1.DeviceCounterConsumption
 }
 
 // DeviceAttributeValue holds a typed attribute value.
@@ -88,8 +94,11 @@ func (v DeviceAttributeValue) String() string {
 // NodeTopology holds all topology devices discovered on a single node across all drivers.
 type NodeTopology struct {
 	NodeName string
-	// Devices grouped by driver name.
+	// Devices grouped by slice name (key is ResourceSlice name).
 	DevicesByDriver map[string][]TopologyDevice
+	// SharedCounters holds counter set definitions from ResourceSlices,
+	// keyed by slice name for correlation with devices in the same pool.
+	SharedCounters map[string][]CounterSetInfo
 }
 
 // AllDevices returns a flat list of all devices on this node.
@@ -114,14 +123,23 @@ func (nt *NodeTopology) DevicesForDriver(driverName string) []TopologyDevice {
 	return result
 }
 
+// CounterSetInfo associates a shared counter set with the pool and driver
+// that published it, enabling per-pool counter tracking.
+type CounterSetInfo struct {
+	PoolName   string
+	DriverName string
+	CounterSet resourcev1.CounterSet
+}
+
 // rawSliceData holds the raw information from a ResourceSlice needed
 // for re-extraction when topology rules change.
 type rawSliceData struct {
-	SliceName  string
-	DriverName string
-	NodeName   string
-	PoolName   string
-	Devices    []resourcev1.Device
+	SliceName      string
+	DriverName     string
+	NodeName       string
+	PoolName       string
+	Devices        []resourcev1.Device
+	SharedCounters []resourcev1.CounterSet
 }
 
 // TopologyModel is the cross-driver topology model built from ResourceSlices.
@@ -205,12 +223,17 @@ func (m *TopologyModel) UpdateFromResourceSlice(slice *resourcev1.ResourceSlice)
 	for i, d := range slice.Spec.Devices {
 		devicesCopy[i] = *d.DeepCopy()
 	}
+	var sharedCountersCopy []resourcev1.CounterSet
+	for _, cs := range slice.Spec.SharedCounters {
+		sharedCountersCopy = append(sharedCountersCopy, *cs.DeepCopy())
+	}
 	m.rawSlices[rawKey] = rawSliceData{
-		SliceName:  slice.Name,
-		DriverName: driverName,
-		NodeName:   nodeName,
-		PoolName:   poolName,
-		Devices:    devicesCopy,
+		SliceName:      slice.Name,
+		DriverName:     driverName,
+		NodeName:       nodeName,
+		PoolName:       poolName,
+		Devices:        devicesCopy,
+		SharedCounters: sharedCountersCopy,
 	}
 
 	// Extract and apply
@@ -223,26 +246,44 @@ func (m *TopologyModel) UpdateFromResourceSlice(slice *resourcev1.ResourceSlice)
 // applySliceDataLocked extracts topology devices from raw slice data
 // and updates the node topology. Must be called with m.mu held.
 func (m *TopologyModel) applySliceDataLocked(raw rawSliceData) {
+	nt, ok := m.nodes[raw.NodeName]
+	if !ok {
+		nt = &NodeTopology{
+			NodeName:        raw.NodeName,
+			DevicesByDriver: make(map[string][]TopologyDevice),
+			SharedCounters:  make(map[string][]CounterSetInfo),
+		}
+		m.nodes[raw.NodeName] = nt
+	}
+
+	// Store shared counter sets from this slice (mutually exclusive with devices).
+	if len(raw.SharedCounters) > 0 {
+		var infos []CounterSetInfo
+		for _, cs := range raw.SharedCounters {
+			infos = append(infos, CounterSetInfo{
+				PoolName:   raw.PoolName,
+				DriverName: raw.DriverName,
+				CounterSet: cs,
+			})
+		}
+		nt.SharedCounters[raw.SliceName] = infos
+		return
+	}
+
 	var devices []TopologyDevice
 	for _, device := range raw.Devices {
 		td := m.extractTopologyDevice(raw.DriverName, device.Name, raw.NodeName, raw.PoolName, device.Attributes)
-		// Extract capacity info
 		if device.Capacity != nil {
 			td.Capacity = make(map[string]string)
 			for capName, capSpec := range device.Capacity {
 				td.Capacity[string(capName)] = capSpec.Value.String()
 			}
 		}
-		devices = append(devices, td)
-	}
-
-	nt, ok := m.nodes[raw.NodeName]
-	if !ok {
-		nt = &NodeTopology{
-			NodeName:        raw.NodeName,
-			DevicesByDriver: make(map[string][]TopologyDevice),
+		if len(device.ConsumesCounters) > 0 {
+			td.ConsumesCounters = make([]resourcev1.DeviceCounterConsumption, len(device.ConsumesCounters))
+			copy(td.ConsumesCounters, device.ConsumesCounters)
 		}
-		m.nodes[raw.NodeName] = nt
+		devices = append(devices, td)
 	}
 
 	nt.DevicesByDriver[raw.SliceName] = devices
@@ -274,9 +315,10 @@ func (m *TopologyModel) RemoveResourceSlice(slice *resourcev1.ResourceSlice) {
 	}
 
 	delete(nt.DevicesByDriver, slice.Name)
+	delete(nt.SharedCounters, slice.Name)
 
 	// Clean up empty nodes
-	if len(nt.DevicesByDriver) == 0 {
+	if len(nt.DevicesByDriver) == 0 && len(nt.SharedCounters) == 0 {
 		delete(m.nodes, nodeName)
 	}
 
@@ -321,6 +363,7 @@ func (nt *NodeTopology) deepCopy() *NodeTopology {
 	cp := &NodeTopology{
 		NodeName:        nt.NodeName,
 		DevicesByDriver: make(map[string][]TopologyDevice, len(nt.DevicesByDriver)),
+		SharedCounters:  make(map[string][]CounterSetInfo, len(nt.SharedCounters)),
 	}
 	for driver, devices := range nt.DevicesByDriver {
 		devicesCopy := make([]TopologyDevice, len(devices))
@@ -328,6 +371,11 @@ func (nt *NodeTopology) deepCopy() *NodeTopology {
 			devicesCopy[i] = d.deepCopy()
 		}
 		cp.DevicesByDriver[driver] = devicesCopy
+	}
+	for sliceName, infos := range nt.SharedCounters {
+		infosCopy := make([]CounterSetInfo, len(infos))
+		copy(infosCopy, infos)
+		cp.SharedCounters[sliceName] = infosCopy
 	}
 	return cp
 }
@@ -351,6 +399,10 @@ func (td TopologyDevice) deepCopy() TopologyDevice {
 	for k, v := range td.ExtendedAttributes {
 		cp.ExtendedAttributes[k] = v
 	}
+	if len(td.ConsumesCounters) > 0 {
+		cp.ConsumesCounters = make([]resourcev1.DeviceCounterConsumption, len(td.ConsumesCounters))
+		copy(cp.ConsumesCounters, td.ConsumesCounters)
+	}
 	return cp
 }
 
@@ -372,10 +424,10 @@ func (m *TopologyModel) IsConstraintSatisfiable(attribute string, driverCounts m
 
 // isConstraintSatisfiableOnNode checks whether a single node has at least one
 // group (same attribute value) that satisfies all driver count requirements.
+// It uses effective device counting to handle overlapping partitionable devices.
 func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribute string, driverCounts map[string]int) bool {
 	// Collect all devices on this node, grouped by the attribute value.
-	// Key: attribute value as string, Value: map[driverName]count
-	groups := make(map[string]map[string]int)
+	devicesByAttrValue := make(map[string][]TopologyDevice)
 
 	for _, devices := range nt.DevicesByDriver {
 		for _, dev := range devices {
@@ -383,18 +435,18 @@ func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribut
 			if val == "" {
 				continue
 			}
-			if groups[val] == nil {
-				groups[val] = make(map[string]int)
-			}
-			groups[val][dev.DriverName]++
+			devicesByAttrValue[val] = append(devicesByAttrValue[val], dev)
 		}
 	}
 
-	// Check if any group satisfies all driver count requirements.
-	for _, driverMap := range groups {
+	// Check if any group satisfies all driver count requirements
+	// using effective counting to deduplicate overlapping partitions.
+	for _, devices := range devicesByAttrValue {
+		effectiveCounts := EffectiveDeviceCount(devices)
+
 		satisfied := true
 		for driver, needed := range driverCounts {
-			if driverMap[driver] < needed {
+			if effectiveCounts[driver] < needed {
 				satisfied = false
 				break
 			}
@@ -409,25 +461,43 @@ func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribut
 // deviceAttributeValueString returns the string representation of the device's
 // value for the given attribute, checking standard attributes and extended attributes.
 func deviceAttributeValueString(dev TopologyDevice, attribute string) string {
+	vals := deviceAttributeValues(dev, attribute)
+	if len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+// deviceAttributeValues returns all matching values for a device attribute.
+// For list-type numaNode, this returns one entry per NUMA node the device
+// is accessible from, enabling correct constraint satisfiability checks.
+func deviceAttributeValues(dev TopologyDevice, attribute string) []string {
 	switch attribute {
 	case AttrNUMANode:
+		if len(dev.NUMANodes) > 0 {
+			vals := make([]string, len(dev.NUMANodes))
+			for i, n := range dev.NUMANodes {
+				vals[i] = fmt.Sprintf("%d", n)
+			}
+			return vals
+		}
 		if dev.NUMANode != nil {
-			return fmt.Sprintf("%d", *dev.NUMANode)
+			return []string{fmt.Sprintf("%d", *dev.NUMANode)}
 		}
 	case AttrPCIeRoot:
 		if dev.PCIeRoot != nil {
-			return *dev.PCIeRoot
+			return []string{*dev.PCIeRoot}
 		}
 	case AttrSocket:
 		if dev.Socket != nil {
-			return fmt.Sprintf("%d", *dev.Socket)
+			return []string{fmt.Sprintf("%d", *dev.Socket)}
 		}
 	default:
 		if v, ok := dev.ExtendedAttributes[attribute]; ok {
-			return v.String()
+			return []string{v.String()}
 		}
 	}
-	return ""
+	return nil
 }
 
 // extractTopologyDevice extracts topology attributes from a device's attributes.
@@ -449,8 +519,12 @@ func (m *TopologyModel) extractTopologyDevice(
 		// Check standard attribute names first
 		switch name {
 		case AttrNUMANode:
-			if attr.IntValue != nil {
+			if len(attr.IntValues) > 0 {
+				td.NUMANodes = attr.IntValues
+				td.NUMANode = &attr.IntValues[0]
+			} else if attr.IntValue != nil {
 				td.NUMANode = attr.IntValue
+				td.NUMANodes = []int64{*attr.IntValue}
 			}
 			continue
 		case AttrPCIeRoot:
@@ -468,10 +542,17 @@ func (m *TopologyModel) extractTopologyDevice(
 		// Check NUMA node aliases — only set if not already found
 		if td.NUMANode == nil {
 			for _, alias := range numaNodeAliases {
-				if name == alias && attr.IntValue != nil {
-					td.NUMANode = attr.IntValue
-					break
+				if name != alias {
+					continue
 				}
+				if len(attr.IntValues) > 0 {
+					td.NUMANodes = attr.IntValues
+					td.NUMANode = &attr.IntValues[0]
+				} else if attr.IntValue != nil {
+					td.NUMANode = attr.IntValue
+					td.NUMANodes = []int64{*attr.IntValue}
+				}
+				break
 			}
 		}
 
@@ -494,8 +575,12 @@ func (m *TopologyModel) extractTopologyDevice(
 			// If the rule maps to a standard topology attribute, apply the mapping
 			switch rule.MapsTo {
 			case MapsToNUMANode:
-				if attr.IntValue != nil {
+				if len(attr.IntValues) > 0 {
+					td.NUMANodes = attr.IntValues
+					td.NUMANode = &attr.IntValues[0]
+				} else if attr.IntValue != nil {
 					td.NUMANode = attr.IntValue
+					td.NUMANodes = []int64{*attr.IntValue}
 				}
 			case MapsToPCIeRoot:
 				if attr.StringValue != nil {

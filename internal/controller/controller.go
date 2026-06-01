@@ -22,12 +22,31 @@ const (
 	reconcileDebounceDelay = 2 * time.Second
 )
 
+// PartitionMode determines which partitioning strategy the controller uses.
+type PartitionMode string
+
+const (
+	PartitionModeAuto       PartitionMode = "auto"
+	PartitionModePartitions PartitionMode = "partitions"
+	PartitionModeGroupings  PartitionMode = "groupings"
+)
+
+// ValidPartitionMode returns true if the given mode string is recognized.
+func ValidPartitionMode(mode string) bool {
+	switch PartitionMode(mode) {
+	case PartitionModeAuto, PartitionModePartitions, PartitionModeGroupings:
+		return true
+	}
+	return false
+}
+
 // Controller is the main topology coordinator controller.
 // It watches ResourceSlices and ConfigMaps, builds a cross-driver topology model,
 // computes aligned partitions, and publishes DeviceClasses describing partition shapes.
 type Controller struct {
-	client     kubernetes.Interface
-	driverName string
+	client        kubernetes.Interface
+	driverName    string
+	partitionMode PartitionMode
 
 	model            *TopologyModel
 	ruleStore        *TopologyRuleStore
@@ -45,18 +64,24 @@ type Controller struct {
 }
 
 // NewController creates a new topology coordinator controller.
-func NewController(client kubernetes.Interface, driverName string) *Controller {
+func NewController(client kubernetes.Interface, driverName string, partitionMode PartitionMode) *Controller {
 	if driverName == "" {
 		driverName = CoordinatorDriverName
+	}
+	if partitionMode == "" {
+		partitionMode = PartitionModeAuto
 	}
 
 	model := NewTopologyModel()
 	ruleStore := NewTopologyRuleStore()
 	groupingStore := NewGroupingStore()
 
+	klog.Infof("Partition mode: %s", partitionMode)
+
 	return &Controller{
 		client:           client,
 		driverName:       driverName,
+		partitionMode:    partitionMode,
 		model:            model,
 		ruleStore:        ruleStore,
 		groupingStore:    groupingStore,
@@ -202,8 +227,23 @@ func (c *Controller) reconcile(ctx context.Context) error {
 
 	groupings := c.groupingStore.GetGroupings()
 
-	if len(groupings) > 0 {
-		// Grouping-based path: validate admin-defined groupings against topology
+	var useGroupings bool
+	switch c.partitionMode {
+	case PartitionModeGroupings:
+		useGroupings = true
+		if len(groupings) == 0 {
+			klog.Warning("Partition mode is 'groupings' but no device grouping ConfigMaps found; no DeviceClasses will be created")
+		}
+	case PartitionModePartitions:
+		useGroupings = false
+		if len(groupings) > 0 {
+			klog.V(4).Infof("Partition mode is 'partitions'; ignoring %d device grouping ConfigMap(s)", len(groupings))
+		}
+	default:
+		useGroupings = len(groupings) > 0
+	}
+
+	if useGroupings {
 		groupingResults := c.groupingBuilder.BuildGroupings(groupings)
 
 		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
@@ -218,7 +258,6 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		klog.Infof("Reconciliation complete (groupings): %d nodes, %d grouping DeviceClasses",
 			len(groupingResults), countGroupingDeviceClasses(groupingResults))
 	} else {
-		// Legacy partition path: auto-discover partitions from topology
 		results := c.partitionBuilder.BuildPartitions()
 
 		if err := c.classManager.SyncDeviceClasses(ctx, results); err != nil {

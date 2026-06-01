@@ -136,15 +136,19 @@ func (b *GroupingBuilder) evaluateGrouping(
 }
 
 // nodeHasRequiredClasses checks if the node has at least one device
-// of each class required by the grouping.
+// of each class required by the grouping, using effective counts
+// to handle overlapping partitionable devices.
 func (b *GroupingBuilder) nodeHasRequiredClasses(
 	devices []TopologyDevice,
 	grouping DeviceGrouping,
 ) bool {
+	// Use effective counting to deduplicate overlapping partitions.
+	effectiveCounts := EffectiveDeviceCount(devices)
+
 	classCounts := make(map[string]int)
-	for _, d := range devices {
-		driverClass := b.rules.GetDeviceClassForDriver(baseDriverName(d.DriverName))
-		classCounts[driverClass]++
+	for driver, count := range effectiveCounts {
+		driverClass := b.rules.GetDeviceClassForDriver(driver)
+		classCounts[driverClass] += count
 	}
 
 	for _, gd := range grouping.Devices {
@@ -178,9 +182,14 @@ func (b *GroupingBuilder) findInstances(
 	for _, key := range keys {
 		groupDevices := groups[key]
 
-		// Count devices per class in this topology group
+		// Filter to effective devices (deduplicate overlapping partitions)
+		// so that one GPU with SPX/DPX/CPX is counted once, not 11 times.
+		effectiveGroupDevices := FilterToEffectiveDevices(groupDevices)
+
+		// Count from the filtered device list so classCounts stays consistent
+		// with devicesByClass (both derived from effectiveGroupDevices).
 		classCounts := make(map[string]int)
-		for _, d := range groupDevices {
+		for _, d := range effectiveGroupDevices {
 			driverClass := b.rules.GetDeviceClassForDriver(baseDriverName(d.DriverName))
 			classCounts[driverClass]++
 		}
@@ -200,9 +209,9 @@ func (b *GroupingBuilder) findInstances(
 			continue
 		}
 
-		// Index devices by class for per-instance allocation
+		// Index effective devices by class for per-instance allocation
 		devicesByClass := make(map[string][]TopologyDevice)
-		for _, d := range groupDevices {
+		for _, d := range effectiveGroupDevices {
 			driverClass := b.rules.GetDeviceClassForDriver(baseDriverName(d.DriverName))
 			devicesByClass[driverClass] = append(devicesByClass[driverClass], d)
 		}

@@ -107,15 +107,26 @@ func (b *PartitionBuilder) buildNodePartitions(
 		return result
 	}
 
-	// Identify distinct drivers (excluding our own coordinator driver)
+	// Filter overlapping partitionable devices down to one representative
+	// per physical resource. This prevents a single GPU advertised as
+	// SPX + 2 DPX + 8 CPX (11 devices) from being counted as 11.
+	nonOverlapping, groups := GroupOverlappingDevices(allDevices)
+	effectiveDevices := make([]TopologyDevice, 0, len(nonOverlapping)+len(groups))
+	effectiveDevices = append(effectiveDevices, nonOverlapping...)
+	for _, g := range groups {
+		effectiveDevices = append(effectiveDevices, selectRepresentative(g.Devices))
+	}
+
 	driverDeviceCounts := make(map[string]int)
-	for _, d := range allDevices {
-		baseName := baseDriverName(d.DriverName)
-		driverDeviceCounts[baseName]++
+	for _, d := range nonOverlapping {
+		driverDeviceCounts[baseDriverName(d.DriverName)]++
+	}
+	for _, g := range groups {
+		driverDeviceCounts[baseDriverName(g.DriverName)] += g.MaxEffective
 	}
 
 	// Group devices by PCIe root for the finest-grained partitioning
-	byPCIeRoot := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+	byPCIeRoot := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
 		if d.PCIeRoot != nil {
 			return *d.PCIeRoot
 		}
@@ -123,7 +134,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 	})
 
 	// Group devices by NUMA node
-	byNUMA := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+	byNUMA := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
 		if d.NUMANode != nil {
 			return fmt.Sprintf("%d", *d.NUMANode)
 		}
@@ -131,7 +142,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 	})
 
 	// Group devices by socket
-	bySocket := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+	bySocket := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
 		if d.Socket != nil {
 			return fmt.Sprintf("%d", *d.Socket)
 		}
@@ -140,7 +151,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 
 	// Validate grouping alignment using extended rules
 	for _, rule := range groupingRules {
-		if !b.validateGroupingAlignment(allDevices, rule) {
+		if !b.validateGroupingAlignment(effectiveDevices, rule) {
 			klog.Warningf("Node %s: devices not aligned by rule attribute %s, skipping extended grouping",
 				nodeName, rule.Attribute)
 		}
@@ -180,7 +191,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 
 	// Build finest-grained first, coarsest last (matches prior order)
 	if pcieTier != "" {
-		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, byPCIeRoot, allDevices)
+		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, byPCIeRoot, effectiveDevices)
 		result.Partitions = append(result.Partitions, p...)
 	}
 
@@ -194,7 +205,7 @@ func (b *PartitionBuilder) buildNodePartitions(
 		result.Partitions = append(result.Partitions, p...)
 	}
 
-	full := b.buildFullPartition(nodeName, profile, allDevices, groupingRules)
+	full := b.buildFullPartition(nodeName, profile, effectiveDevices, groupingRules)
 	if full != nil {
 		result.Partitions = append(result.Partitions, *full)
 	}
@@ -323,12 +334,9 @@ func (b *PartitionBuilder) buildProportionalPartitions( //nolint:unparam
 			continue // no subdivision possible
 		}
 
-		// Count devices per driver on this NUMA node
-		driverCounts := make(map[string]int)
-		for _, d := range devices {
-			baseName := baseDriverName(d.DriverName)
-			driverCounts[baseName]++
-		}
+		// Count effective devices per driver on this NUMA node,
+		// deduplicating overlapping partitionable devices.
+		driverCounts := EffectiveDeviceCount(devices)
 
 		// Determine subdivision factor: use the number of unique PCIe roots
 		// but only consider drivers with multiple devices (>1).
@@ -442,10 +450,10 @@ func buildPartitionFromDevices(
 	pcieSet := make(map[string]bool)
 	socketSet := make(map[int64]bool)
 
-	for _, d := range devices {
-		baseName := baseDriverName(d.DriverName)
-		p.DeviceCounts[baseName]++
+	// Use effective counting to handle overlapping partitionable devices.
+	p.DeviceCounts = EffectiveDeviceCount(devices)
 
+	for _, d := range devices {
 		if d.NUMANode != nil {
 			numaSet[*d.NUMANode] = true
 		}

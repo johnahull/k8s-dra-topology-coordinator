@@ -56,6 +56,10 @@ type SubResourceConfig struct {
 	// each driver's devices are constrained using the driver's own attribute
 	// namespace (e.g., device.attributes["gpu.amd.com"].numaNode == 0).
 	Selectors []string `json:"selectors,omitempty"`
+	// PartitionMode indicates the DRA partition mode for this sub-resource.
+	// When set, the webhook adds a CEL selector to filter by partition type
+	// (e.g., "SPX" for full GPU, "DPX" for half, "CPX" for eighth).
+	PartitionMode string `json:"partitionMode,omitempty"`
 }
 
 // AlignmentConfig defines a matchAttribute constraint for the combined claim.
@@ -253,7 +257,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	}
 
 	// Sub-resources: one entry per driver with its device count, optional capacity,
-	// and per-driver CEL selectors for NUMA pinning.
+	// per-driver CEL selectors for NUMA pinning, and partition mode if applicable.
 	for driver, count := range representative.DeviceCounts {
 		sr := SubResourceConfig{
 			DeviceClass: m.rules.GetDeviceClassForDriver(driver),
@@ -262,6 +266,27 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		if representative.DeviceCapacity != nil {
 			if cap, ok := representative.DeviceCapacity[driver]; ok {
 				sr.Capacity = cap
+			}
+		}
+
+		// Detect partition mode from representative devices' extended attributes.
+		// Drivers advertise mode via attributes like "gpu.amd.com/partitionMode".
+		for _, dev := range representative.Devices {
+			if baseDriverName(dev.DriverName) != driver {
+				continue
+			}
+			if modeAttr, mode := detectPartitionModeAttr(dev); mode != "" {
+				sr.PartitionMode = mode
+				parts := strings.SplitN(modeAttr, "/", 2)
+				if len(parts) == 2 {
+					sr.Selectors = append(sr.Selectors,
+						fmt.Sprintf(`device.attributes[%q].%s == %q`, parts[0], parts[1], mode))
+				} else {
+					// Unqualified attribute — qualify with driver name.
+					sr.Selectors = append(sr.Selectors,
+						fmt.Sprintf(`device.attributes[%q].%s == %q`, driver, modeAttr, mode))
+				}
+				break
 			}
 		}
 
@@ -449,16 +474,18 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 	driversWithAttribute := make(map[string]bool)
 
 	for _, dev := range devices {
-		val := deviceAttributeValueString(dev, attribute)
-		if val == "" {
+		vals := deviceAttributeValues(dev, attribute)
+		if len(vals) == 0 {
 			continue // Device doesn't publish this attribute
 		}
 		driver := baseDriverName(dev.DriverName)
 		driversWithAttribute[driver] = true
-		if groups[val] == nil {
-			groups[val] = make(map[string]int)
+		for _, val := range vals {
+			if groups[val] == nil {
+				groups[val] = make(map[string]int)
+			}
+			groups[val][driver]++
 		}
-		groups[val][driver]++
 	}
 
 	// Need at least 2 drivers with the attribute for a meaningful constraint
@@ -757,6 +784,29 @@ func sanitizeDNSLabel(s string) string {
 	}
 
 	return sanitized
+}
+
+// partitionModeAttributeSuffixes lists attribute name suffixes that indicate
+// a device's partition mode (e.g., "partitionMode", "computePartition").
+var partitionModeAttributeSuffixes = []string{
+	"partitionMode",
+	"computePartition",
+	"mode",
+}
+
+// detectPartitionModeAttr returns the attribute name and mode value from a
+// device's extended attributes. Returns ("", "") if no partition mode found.
+func detectPartitionModeAttr(dev TopologyDevice) (attrName string, mode string) {
+	for name, val := range dev.ExtendedAttributes {
+		for _, suffix := range partitionModeAttributeSuffixes {
+			if strings.HasSuffix(name, "/"+suffix) || name == suffix {
+				if val.StringValue != nil {
+					return name, *val.StringValue
+				}
+			}
+		}
+	}
+	return "", ""
 }
 
 // publishDeviceClass creates or updates a DeviceClass.
