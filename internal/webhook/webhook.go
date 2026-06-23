@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -103,6 +104,14 @@ func (ce *ClaimExpander) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleAdmission processes a single admission request and returns the response.
 func (ce *ClaimExpander) handleAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	// Route by resource type
+	if req.Resource.Group == "" && req.Resource.Resource == "pods" {
+		if req.Operation == admissionv1.Create {
+			return ce.handlePodAdmission(ctx, req)
+		}
+		return allowResponse()
+	}
+
 	// Only handle ResourceClaims
 	if req.Resource.Group != "resource.k8s.io" || req.Resource.Resource != "resourceclaims" {
 		return allowResponse()
@@ -154,6 +163,7 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 	var expandedRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 	anyExpanded := false
+	expansionMap := make(map[string][]string) // original request name → expanded request names
 
 	for _, req := range requests {
 		if req.Exactly == nil {
@@ -178,6 +188,13 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 		expandedRequests = append(expandedRequests, subRequests...)
 		constraints = append(constraints, subConstraints...)
 		anyExpanded = true
+
+		// Track the expansion mapping for Pod rewriting
+		var expandedNames []string
+		for _, sr := range subRequests {
+			expandedNames = append(expandedNames, sr.Name)
+		}
+		expansionMap[req.Name] = expandedNames
 	}
 
 	if !anyExpanded {
@@ -202,12 +219,42 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 				Value: constraints,
 			})
 		} else {
-			merged := append(claim.Spec.Devices.Constraints, constraints...)
+			merged := make([]resourcev1.DeviceConstraint, 0, len(claim.Spec.Devices.Constraints)+len(constraints))
+			merged = append(merged, claim.Spec.Devices.Constraints...)
+			merged = append(merged, constraints...)
 			patches = append(patches, jsonPatch{
 				Op:    "replace",
 				Path:  "/spec/devices/constraints",
 				Value: merged,
 			})
+		}
+	}
+
+	// Annotate the claim with the expansion mapping so the Pod webhook
+	// can rewrite container request references without re-fetching DeviceClasses.
+	if len(expansionMap) > 0 {
+		mapJSON, err := json.Marshal(expansionMap)
+		if err != nil {
+			klog.Warningf("Failed to marshal expansion map: %v", err)
+		} else {
+			annotations := claim.Annotations
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			annotations[driverName+"/expanded-requests"] = string(mapJSON)
+			if claim.Annotations == nil {
+				patches = append(patches, jsonPatch{
+					Op:    "add",
+					Path:  "/metadata/annotations",
+					Value: annotations,
+				})
+			} else {
+				patches = append(patches, jsonPatch{
+					Op:    "add",
+					Path:  "/metadata/annotations/" + escapeJSONPointer(driverName+"/expanded-requests"),
+					Value: string(mapJSON),
+				})
+			}
 		}
 	}
 
@@ -383,6 +430,134 @@ func sanitizeDeviceClassName(name string) string {
 	}
 
 	return sanitized
+}
+
+// handlePodAdmission rewrites container resource claim request names to match
+// expanded partition request names. This makes partition expansion transparent
+// to consumers like KubeVirt that read KEP-5304 metadata by request name.
+func (ce *ClaimExpander) handlePodAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	var pod corev1.Pod
+	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+		klog.Errorf("Failed to unmarshal Pod: %v", err)
+		return allowResponse()
+	}
+
+	// Build a map of pod claim name → expansion mapping by looking up referenced claims
+	type claimExpansion struct {
+		mapping map[string][]string // original request → expanded requests
+	}
+	claimExpansions := make(map[string]*claimExpansion) // pod claim name → expansion
+
+	for _, prc := range pod.Spec.ResourceClaims {
+		// Resolve the claim name — direct reference or template-generated.
+		// Template-generated claims use a naming convention: <pod-name>-<template-name>.
+		// During CREATE admission the pod may not have a name yet (generateName),
+		// so we try direct lookup first.
+		var claimToLookup string
+		if prc.ResourceClaimName != nil && *prc.ResourceClaimName != "" {
+			claimToLookup = *prc.ResourceClaimName
+		} else if prc.ResourceClaimTemplateName != nil && *prc.ResourceClaimTemplateName != "" {
+			// For template claims, the ResourceClaim is created by the scheduler
+			// with name <pod-name>-<claim-name>. Try looking up the template claim.
+			claimToLookup = *prc.ResourceClaimTemplateName
+		}
+		if claimToLookup == "" {
+			continue
+		}
+
+		claim, err := ce.client.ResourceV1().ResourceClaims(req.Namespace).Get(ctx, claimToLookup, metav1.GetOptions{})
+		if err != nil {
+			klog.V(4).Infof("Could not look up claim %s/%s for pod rewriting: %v", req.Namespace, claimToLookup, err)
+			continue
+		}
+
+		annotation := claim.Annotations[driverName+"/expanded-requests"]
+		if annotation == "" {
+			continue
+		}
+
+		var mapping map[string][]string
+		if err := json.Unmarshal([]byte(annotation), &mapping); err != nil {
+			klog.Warningf("Failed to parse expansion annotation on claim %s: %v", claimToLookup, err)
+			continue
+		}
+
+		claimExpansions[prc.Name] = &claimExpansion{mapping: mapping}
+	}
+
+	if len(claimExpansions) == 0 {
+		return allowResponse()
+	}
+
+	var patches []jsonPatch
+
+	// Rewrite container claim references
+	rewriteContainerClaims := func(containerPath string, containers []corev1.Container) {
+		for i, ctr := range containers {
+			var newClaims []corev1.ResourceClaim
+			changed := false
+			for _, rc := range ctr.Resources.Claims {
+				exp, ok := claimExpansions[rc.Name]
+				if !ok || rc.Request == "" {
+					newClaims = append(newClaims, rc)
+					continue
+				}
+				expandedNames, ok := exp.mapping[rc.Request]
+				if !ok {
+					newClaims = append(newClaims, rc)
+					continue
+				}
+				// Expand into N entries, one per sub-request
+				for _, expandedName := range expandedNames {
+					newClaims = append(newClaims, corev1.ResourceClaim{
+						Name:    rc.Name,
+						Request: expandedName,
+					})
+				}
+				changed = true
+			}
+			if changed {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("%s/%d/resources/claims", containerPath, i),
+					Value: newClaims,
+				})
+			}
+		}
+	}
+
+	rewriteContainerClaims("/spec/containers", pod.Spec.Containers)
+	rewriteContainerClaims("/spec/initContainers", pod.Spec.InitContainers)
+
+	if len(patches) == 0 {
+		return allowResponse()
+	}
+
+	podID := pod.Name
+	if podID == "" {
+		podID = pod.GenerateName + "*"
+	}
+	klog.Infof("Rewriting %d container claim references in pod %s/%s", len(patches), req.Namespace, podID)
+
+	patchBytes, err := json.Marshal(patches)
+	if err != nil {
+		klog.Errorf("Failed to marshal pod patches: %v", err)
+		return allowResponse()
+	}
+
+	patchType := admissionv1.PatchTypeJSONPatch
+	return &admissionv1.AdmissionResponse{
+		Allowed:   true,
+		PatchType: &patchType,
+		Patch:     patchBytes,
+	}
+}
+
+// escapeJSONPointer escapes special characters in JSON Pointer tokens (RFC 6901).
+func escapeJSONPointer(s string) string {
+	s = strings.ReplaceAll(s, "~", "~0")
+	s = strings.ReplaceAll(s, "/", "~1")
+	return s
 }
 
 // allowResponse returns an admission response that allows the request without mutation.
