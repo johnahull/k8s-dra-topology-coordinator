@@ -112,6 +112,13 @@ func (ce *ClaimExpander) handleAdmission(ctx context.Context, req *admissionv1.A
 		return allowResponse()
 	}
 
+	if req.Resource.Group == "kubevirt.io" && req.Resource.Resource == "virtualmachineinstances" {
+		if req.Operation == admissionv1.Create {
+			return ce.handleVMIAdmission(ctx, req)
+		}
+		return allowResponse()
+	}
+
 	// Only handle ResourceClaims
 	if req.Resource.Group != "resource.k8s.io" || req.Resource.Resource != "resourceclaims" {
 		return allowResponse()
@@ -551,6 +558,192 @@ func (ce *ClaimExpander) handlePodAdmission(ctx context.Context, req *admissionv
 		PatchType: &patchType,
 		Patch:     patchBytes,
 	}
+}
+
+// handleVMIAdmission rewrites GPU and HostDevice requestName fields in a
+// KubeVirt VirtualMachineInstance to match expanded partition request names.
+func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	var vmi map[string]interface{}
+	if err := json.Unmarshal(req.Object.Raw, &vmi); err != nil {
+		klog.Errorf("Failed to unmarshal VMI: %v", err)
+		return allowResponse()
+	}
+
+	// Build expansion map from referenced claims
+	expansionMap := make(map[string]map[string][]string) // claim name -> original request -> expanded requests
+
+	resourceClaims, _ := nestedSlice(vmi, "spec", "resourceClaims")
+	for _, rc := range resourceClaims {
+		rcMap, ok := rc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		claimName, _ := rcMap["resourceClaimName"].(string)
+		if claimName == "" {
+			continue
+		}
+
+		claim, err := ce.client.ResourceV1().ResourceClaims(req.Namespace).Get(ctx, claimName, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+
+		annotation := claim.Annotations[driverName+"/expanded-requests"]
+		if annotation == "" {
+			continue
+		}
+
+		var mapping map[string][]string
+		if err := json.Unmarshal([]byte(annotation), &mapping); err != nil {
+			continue
+		}
+
+		rcName, _ := rcMap["name"].(string)
+		expansionMap[rcName] = mapping
+	}
+
+	if len(expansionMap) == 0 {
+		return allowResponse()
+	}
+
+	var patches []jsonPatch
+
+	// Rewrite gpus[].requestName
+	gpus, _ := nestedSlice(vmi, "spec", "domain", "devices", "gpus")
+	for i, g := range gpus {
+		gMap, ok := g.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		claimName, _ := gMap["claimName"].(string)
+		requestName, _ := gMap["requestName"].(string)
+		if claimName == "" || requestName == "" {
+			continue
+		}
+		mapping, ok := expansionMap[claimName]
+		if !ok {
+			continue
+		}
+		expanded, ok := mapping[requestName]
+		if !ok || len(expanded) == 0 {
+			continue
+		}
+		// Find the GPU sub-request (contains "gpu" in the name)
+		for _, name := range expanded {
+			if strings.Contains(name, "gpu") {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("/spec/domain/devices/gpus/%d/requestName", i),
+					Value: name,
+				})
+				break
+			}
+		}
+	}
+
+	// Rewrite hostDevices[].requestName
+	hostDevices, _ := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+	for i, hd := range hostDevices {
+		hdMap, ok := hd.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		claimName, _ := hdMap["claimName"].(string)
+		requestName, _ := hdMap["requestName"].(string)
+		if claimName == "" || requestName == "" {
+			continue
+		}
+		mapping, ok := expansionMap[claimName]
+		if !ok {
+			continue
+		}
+		expanded, ok := mapping[requestName]
+		if !ok || len(expanded) == 0 {
+			continue
+		}
+		// For hostDevices, use the device name hint to match
+		deviceName, _ := hdMap["name"].(string)
+		matched := false
+		for _, name := range expanded {
+			if strings.Contains(name, "nvme") && strings.Contains(deviceName, "nvme") {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
+					Value: name,
+				})
+				matched = true
+				break
+			}
+			if strings.Contains(name, "net") && strings.Contains(deviceName, "nic") {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
+					Value: name,
+				})
+				matched = true
+				break
+			}
+			if strings.Contains(name, "sriov") && strings.Contains(deviceName, "nic") {
+				patches = append(patches, jsonPatch{
+					Op:    "replace",
+					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
+					Value: name,
+				})
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			// Fallback: use first non-GPU expanded name
+			for _, name := range expanded {
+				if !strings.Contains(name, "gpu") {
+					patches = append(patches, jsonPatch{
+						Op:    "replace",
+						Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
+						Value: name,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	if len(patches) == 0 {
+		return allowResponse()
+	}
+
+	vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
+	klog.Infof("Rewriting %d device request names in VMI %s/%s", len(patches), req.Namespace, vmiName)
+
+	patchBytes, err := json.Marshal(patches)
+	if err != nil {
+		klog.Errorf("Failed to marshal VMI patches: %v", err)
+		return allowResponse()
+	}
+
+	patchType := admissionv1.PatchTypeJSONPatch
+	return &admissionv1.AdmissionResponse{
+		Allowed:   true,
+		PatchType: &patchType,
+		Patch:     patchBytes,
+	}
+}
+
+// nestedSlice extracts a nested []interface{} from a map hierarchy.
+func nestedSlice(obj map[string]interface{}, fields ...string) ([]interface{}, bool) {
+	current := obj
+	for i, field := range fields {
+		if i == len(fields)-1 {
+			val, ok := current[field].([]interface{})
+			return val, ok
+		}
+		next, ok := current[field].(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		current = next
+	}
+	return nil, false
 }
 
 // escapeJSONPointer escapes special characters in JSON Pointer tokens (RFC 6901).
