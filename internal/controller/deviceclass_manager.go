@@ -140,10 +140,50 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		}
 	}
 
+	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
+	// No NUMA/PCIe selectors — the scheduler picks placement.
+	type aggregateKey struct {
+		profile  string
+		partType PartitionType
+	}
+	aggregates := make(map[aggregateKey]*profilePartition)
+	for _, pp := range seen {
+		if pp.partType == PartitionFull {
+			continue
+		}
+		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
+		if existing, ok := aggregates[ak]; ok {
+			existing.count += pp.count
+		} else {
+			aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
+			aggregates[ak] = &profilePartition{
+				profile:        pp.profile,
+				partType:       pp.partType,
+				representative: pp.representative,
+				cachedConfig:   aggConfig,
+				cachedCoupling: aggCoupling,
+				count:          pp.count,
+			}
+		}
+	}
+	for _, pp := range aggregates {
+		aggRep := pp.representative
+		aggRep.NUMANodes = nil
+		aggRep.PCIeRoots = nil
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
 	// Clean up stale DeviceClasses no longer matching any partition
 	activeKeys := make(map[string]bool, len(seen))
 	for key := range seen {
 		activeKeys[key] = true
+	}
+	for ak := range aggregates {
+		aggKey := truncateLabel(ak.profile) + "-" + string(ak.partType)
+		activeKeys[aggKey] = true
 	}
 	if err := m.cleanupStaleDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale DeviceClasses: %v", err)
@@ -406,6 +446,75 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 				Enforcement: enforcement,
 			})
 		}
+	}
+
+	return config, coupling
+}
+
+// buildPartitionAggregateConfig builds a PartitionConfig without NUMA/PCIe
+// selectors for aggregate DeviceClasses. Keeps alignment constraints and
+// device counts but lets the scheduler choose placement freely.
+func (m *DeviceClassManager) buildPartitionAggregateConfig(representative PartitionDevice) (PartitionConfig, CouplingLevel) {
+	config := PartitionConfig{
+		Kind: "PartitionConfig",
+	}
+
+	for driver, count := range representative.DeviceCounts {
+		sr := SubResourceConfig{
+			DeviceClass: m.rules.GetDeviceClassForDriver(driver),
+			Count:       count,
+		}
+		if representative.DeviceCapacity != nil {
+			if cap, ok := representative.DeviceCapacity[driver]; ok {
+				sr.Capacity = cap
+			}
+		}
+		config.SubResources = append(config.SubResources, sr)
+	}
+
+	coupling := CouplingNone
+	matchRules := m.rules.GetMatchConstraintRules()
+	for _, rule := range matchRules {
+		if rule.Driver != "" {
+			if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
+				continue
+			}
+		}
+
+		var constraintRequests []string
+		if len(representative.Devices) > 0 {
+			driversWithAttribute := make(map[string]bool)
+			for _, dev := range representative.Devices {
+				val := deviceAttributeValueString(dev, rule.Attribute)
+				if val != "" {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				}
+			}
+			for driver := range representative.DeviceCounts {
+				if driversWithAttribute[baseDriverName(driver)] {
+					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+			if len(constraintRequests) == 0 {
+				continue
+			}
+		}
+
+		if len(constraintRequests) < 2 {
+			continue
+		}
+
+		enforcement := rule.Enforcement
+		if enforcement == "" {
+			enforcement = EnforcementRequired
+		}
+
+		config.Alignments = append(config.Alignments, AlignmentConfig{
+			Attribute:   rule.Attribute,
+			Requests:    constraintRequests,
+			Enforcement: enforcement,
+		})
+		coupling = CouplingTight
 	}
 
 	return config, coupling
