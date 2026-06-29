@@ -171,6 +171,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		aggRep.NUMANodes = nil
 		aggRep.PCIeRoots = nil
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		dc.Name = string(pp.partType)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
 		}
@@ -697,7 +698,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	for _, entry := range aggregates {
 		aggKey := truncateLabel(entry.representative.GroupingName) + "-" + sanitizeForName(entry.representative.Alignment)
 		dc := m.buildGroupingDeviceClass(aggKey, entry.representative, entry.config, entry.count)
-		// Override: no NUMA label on the aggregate
+		dc.Name = sanitizeForName(entry.representative.GroupingName)
 		delete(dc.Labels, CoordinatorDriverName+"/numa")
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
