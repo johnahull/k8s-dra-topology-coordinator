@@ -132,6 +132,9 @@ func (b *GroupingBuilder) evaluateGrouping(
 		}
 	}
 
+	// Add proportional CPU/memory from the parent NUMA to each instance.
+	b.enrichWithSharedDevices(instances, allDevices, grouping)
+
 	return instances
 }
 
@@ -331,6 +334,96 @@ func (b *GroupingBuilder) buildInstance(
 	sort.Slice(inst.Sockets, func(i, j int) bool { return inst.Sockets[i] < inst.Sockets[j] })
 
 	return inst
+}
+
+// enrichWithSharedDevices adds proportional CPU/memory from the parent NUMA node
+// to each grouping instance. Devices with consumable capacity (like CPU and memory)
+// that aren't explicitly requested in the grouping definition are divided equally
+// among instances on the same NUMA node.
+func (b *GroupingBuilder) enrichWithSharedDevices(
+	instances []GroupingInstance,
+	allDevices []TopologyDevice,
+	grouping DeviceGrouping,
+) {
+	if len(instances) == 0 {
+		return
+	}
+
+	// Build set of explicitly requested device classes
+	requestedClasses := make(map[string]bool)
+	for _, gd := range grouping.Devices {
+		requestedClasses[gd.Class] = true
+	}
+
+	// Count instances per NUMA node
+	instancesPerNUMA := make(map[int64]int)
+	for _, inst := range instances {
+		for _, n := range inst.NUMANodes {
+			instancesPerNUMA[n]++
+		}
+	}
+
+	// Find shared devices (those with capacity that aren't explicitly requested)
+	type sharedDevice struct {
+		device   TopologyDevice
+		numaNode int64
+	}
+	var sharedDevices []sharedDevice
+	for _, d := range allDevices {
+		if d.NUMANode == nil || len(d.Capacity) == 0 {
+			continue
+		}
+		driverClass := b.rules.GetDeviceClassForDriver(baseDriverName(d.DriverName))
+		if requestedClasses[driverClass] {
+			continue
+		}
+		sharedDevices = append(sharedDevices, sharedDevice{device: d, numaNode: *d.NUMANode})
+	}
+
+	if len(sharedDevices) == 0 {
+		return
+	}
+
+	// For each instance, add proportional capacity from shared devices on same NUMA
+	for i := range instances {
+		inst := &instances[i]
+		if len(inst.NUMANodes) == 0 {
+			continue
+		}
+		primaryNUMA := inst.NUMANodes[0]
+		divisor := instancesPerNUMA[primaryNUMA]
+		if divisor <= 0 {
+			divisor = 1
+		}
+
+		for _, sd := range sharedDevices {
+			if sd.numaNode != primaryNUMA {
+				continue
+			}
+			driverClass := b.rules.GetDeviceClassForDriver(baseDriverName(sd.device.DriverName))
+
+			// Already added this driver class to this instance
+			if inst.DeviceCounts[driverClass] > 0 {
+				continue
+			}
+
+			capPerInstance := make(map[string]string)
+			for capName, capVal := range sd.device.Capacity {
+				dv := divideQuantity(capVal, divisor)
+				if dv != "" {
+					capPerInstance[capName] = dv
+				}
+			}
+			if len(capPerInstance) > 0 {
+				inst.DeviceCounts[driverClass] = 1
+				if inst.DeviceCapacity == nil {
+					inst.DeviceCapacity = make(map[string]map[string]string)
+				}
+				inst.DeviceCapacity[driverClass] = capPerInstance
+				inst.Devices = append(inst.Devices, sd.device)
+			}
+		}
+	}
 }
 
 // collectUsedDevices returns a set of device keys from instances for deduplication.

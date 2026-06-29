@@ -65,8 +65,8 @@ func TestDeviceClassManager_SyncDeviceClasses(t *testing.T) {
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 
-	// Should have 4 classes: pcieroot + numa (specific) + pcieroot + numa (aggregates)
-	assert.Len(t, classes.Items, 4)
+	// Should have 2 classes: one pcieroot, one numa
+	assert.Len(t, classes.Items, 2)
 
 	// Verify labels
 	for _, dc := range classes.Items {
@@ -114,7 +114,7 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	dc := findSpecificDC(classes.Items)
 
@@ -212,7 +212,7 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -274,7 +274,7 @@ func TestDeviceClassManager_WithMatchConstraintRules(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -328,7 +328,7 @@ func TestDeviceClassManager_EnforcementPropagation(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -398,7 +398,7 @@ func TestDeviceClassManager_PerDriverCELSelectors(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -511,7 +511,7 @@ func TestDeviceClassManager_CleansUpStaleClasses(t *testing.T) {
 	require.NoError(t, err)
 
 	classes, _ := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
-	assert.Len(t, classes.Items, 4, "should have 4 DeviceClasses after first sync (2 specific + 2 aggregates)")
+	assert.Len(t, classes.Items, 2, "should have 2 DeviceClasses after first sync")
 
 	// Second sync: only pcieroot remains (GPUs removed, no numa partition anymore)
 	results = []PartitionResult{
@@ -527,7 +527,7 @@ func TestDeviceClassManager_CleansUpStaleClasses(t *testing.T) {
 	require.NoError(t, err)
 
 	classes, _ = client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
-	assert.Len(t, classes.Items, 2, "stale numa DeviceClass should be cleaned up, aggregate remains")
+	assert.Len(t, classes.Items, 1, "stale numa DeviceClass should be cleaned up")
 	assert.Contains(t, findSpecificDC(classes.Items).Name, "pcieroot")
 }
 
@@ -577,7 +577,7 @@ func TestDeviceClassManager_FallbackCouplingTight(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	// Should have tight coupling label
 	assert.Equal(t, "tight", findSpecificDC(classes.Items).Labels[CoordinatorDriverName+"/coupling"])
@@ -642,7 +642,7 @@ func TestDeviceClassManager_FallbackCouplingLoose(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	// Should have loose coupling label
 	assert.Equal(t, "loose", findSpecificDC(classes.Items).Labels[CoordinatorDriverName+"/coupling"])
@@ -721,7 +721,7 @@ func TestDeviceClassManager_FallbackMixedCoupling(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should have 2 DeviceClasses: one tight, one loose
-	assert.Len(t, classes.Items, 3, "mixed coupling should produce 2 DeviceClasses + 1 aggregate")
+	assert.Len(t, classes.Items, 2, "mixed coupling should produce 2 DeviceClasses")
 
 	couplings := map[string]bool{}
 	for _, dc := range classes.Items {
@@ -768,7 +768,7 @@ func TestDeviceClassManager_NoFallbackAttribute(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 2)
+	require.Len(t, classes.Items, 1)
 
 	// With the default pcieroot rule (which has fallback), coupling label may
 	// be set to "loose" when devices don't publish pcieroot. The explicit

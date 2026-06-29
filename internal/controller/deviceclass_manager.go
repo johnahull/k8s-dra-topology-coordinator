@@ -140,51 +140,10 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		}
 	}
 
-	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
-	// No NUMA/PCIe selectors — the scheduler picks placement.
-	type aggregateKey struct {
-		profile  string
-		partType PartitionType
-	}
-	aggregates := make(map[aggregateKey]*profilePartition)
-	for _, pp := range seen {
-		if pp.partType == PartitionFull {
-			continue
-		}
-		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
-		if existing, ok := aggregates[ak]; ok {
-			existing.count += pp.count
-		} else {
-			aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
-			aggregates[ak] = &profilePartition{
-				profile:        pp.profile,
-				partType:       pp.partType,
-				representative: pp.representative,
-				cachedConfig:   aggConfig,
-				cachedCoupling: aggCoupling,
-				count:          pp.count,
-			}
-		}
-	}
-	for _, pp := range aggregates {
-		aggRep := pp.representative
-		aggRep.NUMANodes = nil
-		aggRep.PCIeRoots = nil
-		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
-		dc.Name = string(pp.partType)
-		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
-		}
-	}
-
 	// Clean up stale DeviceClasses no longer matching any partition
 	activeKeys := make(map[string]bool, len(seen))
 	for key := range seen {
 		activeKeys[key] = true
-	}
-	for ak := range aggregates {
-		aggKey := truncateLabel(ak.profile) + "-" + string(ak.partType)
-		activeKeys[aggKey] = true
 	}
 	if err := m.cleanupStaleDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale DeviceClasses: %v", err)
