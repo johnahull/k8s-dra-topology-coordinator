@@ -543,7 +543,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 			config := m.buildGroupingConfig(inst)
 
 			nk := numaKey(inst.NUMANodes)
-			key := inst.GroupingName + "-" + sanitizeForName(inst.Alignment)
+			key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
 			if nk != "" {
 				key += "-numa" + nk
 			}
@@ -560,6 +560,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		}
 	}
 
+	// Emit per-instance DeviceClasses (NUMA-specific)
 	for key, entry := range seen {
 		dc := m.buildGroupingDeviceClass(key, entry.representative, entry.config, entry.count)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
@@ -567,9 +568,40 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		}
 	}
 
+	// Emit aggregate DeviceClasses (one per grouping name, no NUMA selector).
+	// Lets users request "any gpu-nic-pair" without specifying a NUMA node;
+	// the scheduler finds a satisfiable placement automatically.
+	aggregates := make(map[string]*groupingEntry)
+	for _, entry := range seen {
+		name := entry.representative.GroupingName
+		if _, ok := aggregates[name]; !ok {
+			aggConfig := m.buildGroupingAggregateConfig(entry.representative)
+			aggregates[name] = &groupingEntry{
+				representative: entry.representative,
+				config:         aggConfig,
+				count:          entry.count,
+			}
+		} else {
+			aggregates[name].count += entry.count
+		}
+	}
+	for _, entry := range aggregates {
+		aggKey := truncateLabel(entry.representative.GroupingName) + "-" + sanitizeForName(entry.representative.Alignment)
+		dc := m.buildGroupingDeviceClass(aggKey, entry.representative, entry.config, entry.count)
+		// Override: no NUMA label on the aggregate
+		delete(dc.Labels, CoordinatorDriverName+"/numa")
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
 	activeKeys := make(map[string]bool, len(seen))
 	for key := range seen {
 		activeKeys[key] = true
+	}
+	for _, entry := range aggregates {
+		aggKey := truncateLabel(entry.representative.GroupingName) + "-" + sanitizeForName(entry.representative.Alignment)
+		activeKeys[aggKey] = true
 	}
 	if err := m.cleanupStaleGroupingDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale grouping DeviceClasses: %v", err)
@@ -581,6 +613,16 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 
 // buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.
 func (m *DeviceClassManager) buildGroupingConfig(inst GroupingInstance) PartitionConfig {
+	return m.buildGroupingConfigInternal(inst, true)
+}
+
+// buildGroupingAggregateConfig builds a PartitionConfig without NUMA selectors,
+// so the scheduler can place on any NUMA node with available devices.
+func (m *DeviceClassManager) buildGroupingAggregateConfig(inst GroupingInstance) PartitionConfig {
+	return m.buildGroupingConfigInternal(inst, false)
+}
+
+func (m *DeviceClassManager) buildGroupingConfigInternal(inst GroupingInstance, includeNUMA bool) PartitionConfig {
 	config := PartitionConfig{
 		Kind: "PartitionConfig",
 	}
@@ -595,9 +637,7 @@ func (m *DeviceClassManager) buildGroupingConfig(inst GroupingInstance) Partitio
 			sr.Capacity = cap
 		}
 
-		// Per-driver NUMA CEL selectors
-		if len(inst.NUMANodes) > 0 {
-			// Find the driver name for this device class to look up NUMA attribute
+		if includeNUMA && len(inst.NUMANodes) > 0 {
 			driver := m.driverForClass(driverClass)
 			if attr, ok := m.rules.GetNUMAAttributeForDriver(driver); ok {
 				if !strings.Contains(attr, "/") {
@@ -618,11 +658,12 @@ func (m *DeviceClassManager) buildGroupingConfig(inst GroupingInstance) Partitio
 		config.SubResources = append(config.SubResources, sr)
 	}
 
-	// Alignment constraints from topology rules (same logic as partition path)
 	matchRules := m.rules.GetMatchConstraintRules()
 	for _, rule := range matchRules {
-		if _, ok := inst.DeviceCounts[m.rules.GetDeviceClassForDriver(rule.Driver)]; !ok {
-			continue
+		if rule.Driver != "" {
+			if _, ok := inst.DeviceCounts[m.rules.GetDeviceClassForDriver(rule.Driver)]; !ok {
+				continue
+			}
 		}
 
 		var constraintRequests []string
