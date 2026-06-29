@@ -132,9 +132,6 @@ func (b *GroupingBuilder) evaluateGrouping(
 		}
 	}
 
-	// Add proportional CPU/memory from the parent NUMA to each instance.
-	b.enrichWithSharedDevices(instances, allDevices, grouping)
-
 	return instances
 }
 
