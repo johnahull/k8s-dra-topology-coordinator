@@ -227,37 +227,14 @@ func (c *Controller) reconcile(ctx context.Context) error {
 
 	groupings := c.groupingStore.GetGroupings()
 
-	var useGroupings bool
-	switch c.partitionMode {
-	case PartitionModeGroupings:
-		useGroupings = true
-		if len(groupings) == 0 {
-			klog.Warning("Partition mode is 'groupings' but no device grouping ConfigMaps found; no DeviceClasses will be created")
-		}
-	case PartitionModePartitions:
-		useGroupings = false
-		if len(groupings) > 0 {
-			klog.V(4).Infof("Partition mode is 'partitions'; ignoring %d device grouping ConfigMap(s)", len(groupings))
-		}
-	default:
-		useGroupings = len(groupings) > 0
-	}
+	skipPartitions := c.partitionMode == PartitionModeGroupings
+	skipGroupings := c.partitionMode == PartitionModePartitions
 
-	if useGroupings {
-		groupingResults := c.groupingBuilder.BuildGroupings(groupings)
+	partitionCount := 0
+	groupingCount := 0
+	nodeCount := 0
 
-		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
-			metrics.ReconciliationErrors.Inc()
-			return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
-		}
-
-		metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
-		metrics.NodesTotal.Set(float64(len(groupingResults)))
-		metrics.DeviceClassesTotal.Set(float64(countGroupingDeviceClasses(groupingResults)))
-
-		klog.Infof("Reconciliation complete (groupings): %d nodes, %d grouping DeviceClasses",
-			len(groupingResults), countGroupingDeviceClasses(groupingResults))
-	} else {
+	if !skipPartitions {
 		results := c.partitionBuilder.BuildPartitions()
 
 		if err := c.classManager.SyncDeviceClasses(ctx, results); err != nil {
@@ -265,12 +242,29 @@ func (c *Controller) reconcile(ctx context.Context) error {
 			return fmt.Errorf("failed to sync DeviceClasses: %w", err)
 		}
 
-		metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
-		metrics.NodesTotal.Set(float64(len(results)))
-		metrics.DeviceClassesTotal.Set(float64(countDeviceClasses(results)))
+		nodeCount = len(results)
+		metrics.NodesTotal.Set(float64(nodeCount))
+		partitionCount = countDeviceClasses(results)
+	}
 
-		klog.Infof("Reconciliation complete (partitions): %d nodes, %d DeviceClasses",
-			len(results), countDeviceClasses(results))
+	if !skipGroupings && len(groupings) > 0 {
+		groupingResults := c.groupingBuilder.BuildGroupings(groupings)
+
+		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
+		}
+
+		groupingCount = countGroupingDeviceClasses(groupingResults)
+	}
+
+	metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
+	metrics.DeviceClassesTotal.Set(float64(partitionCount + groupingCount))
+
+	klog.Infof("Reconciliation complete (partitions): %d nodes, %d DeviceClasses",
+		nodeCount, partitionCount)
+	if groupingCount > 0 {
+		klog.Infof("Reconciliation complete (groupings): %d grouping DeviceClasses", groupingCount)
 	}
 
 	return nil

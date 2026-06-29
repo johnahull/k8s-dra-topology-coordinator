@@ -365,6 +365,7 @@ func sanitizeForName(s string) string {
 	return strings.ToLower(strings.NewReplacer(
 		"/", "-",
 		".", "-",
+		":", "-",
 	).Replace(s))
 }
 

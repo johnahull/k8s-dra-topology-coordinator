@@ -3,7 +3,6 @@ package controller
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -14,10 +13,9 @@ import (
 type PartitionType string
 
 const (
-	PartitionEighth  PartitionType = "eighth"
-	PartitionQuarter PartitionType = "quarter"
-	PartitionHalf    PartitionType = "half"
-	PartitionFull    PartitionType = "full"
+	PartitionPCIeRoot PartitionType = "pcieroot"
+	PartitionNUMA     PartitionType = "numa"
+	PartitionFull     PartitionType = "full"
 )
 
 // PartitionDevice represents a computed partition that the coordinator will publish
@@ -141,14 +139,6 @@ func (b *PartitionBuilder) buildNodePartitions(
 		return ""
 	})
 
-	// Group devices by socket
-	bySocket := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
-		if d.Socket != nil {
-			return fmt.Sprintf("%d", *d.Socket)
-		}
-		return ""
-	})
-
 	// Validate grouping alignment using extended rules
 	for _, rule := range groupingRules {
 		if !b.validateGroupingAlignment(effectiveDevices, rule) {
@@ -157,54 +147,18 @@ func (b *PartitionBuilder) buildNodePartitions(
 		}
 	}
 
-	// Build partitions by successive bisection.
-	// Walk socket → NUMA → PCIe root; assign half/quarter/eighth
-	// to boundaries that actually split. Skip boundaries that don't.
 	profile := b.inferProfile(driverDeviceCounts)
 	result.Profile = profile
 
-	tiers := []PartitionType{PartitionHalf, PartitionQuarter, PartitionEighth}
-	tierIdx := 0
-	prevCount := 1
+	// Build pcieRoot partitions: one per PCIe root with proportional CPU/memory
+	pciePartitions := b.buildPCIeRootPartitions(nodeName, profile, byNUMA, byPCIeRoot, effectiveDevices)
+	result.Partitions = append(result.Partitions, pciePartitions...)
 
-	socketCount := countNonEmptyGroups(bySocket)
-	numaCount := countNonEmptyGroups(byNUMA)
+	// Build NUMA partitions: one per NUMA node with all devices on that NUMA
+	numaPartitions := b.buildPartitionsFromGroups(nodeName, profile, PartitionNUMA, byNUMA, groupingRules)
+	result.Partitions = append(result.Partitions, numaPartitions...)
 
-	// Determine which tier label each boundary gets
-	socketTier := PartitionType("")
-	numaTier := PartitionType("")
-	pcieTier := PartitionType("")
-
-	if socketCount > prevCount && tierIdx < len(tiers) {
-		socketTier = tiers[tierIdx]
-		prevCount = socketCount
-		tierIdx++
-	}
-	if numaCount > prevCount && tierIdx < len(tiers) {
-		numaTier = tiers[tierIdx]
-		prevCount = numaCount
-		tierIdx++
-	}
-	if tierIdx < len(tiers) {
-		pcieTier = tiers[tierIdx]
-	}
-
-	// Build finest-grained first, coarsest last (matches prior order)
-	if pcieTier != "" {
-		p := b.buildProportionalPartitions(nodeName, profile, pcieTier, byNUMA, byPCIeRoot, effectiveDevices)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
-	if numaTier != "" {
-		p := b.buildPartitionsFromGroups(nodeName, profile, numaTier, byNUMA, groupingRules)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
-	if socketTier != "" {
-		p := b.buildPartitionsFromGroups(nodeName, profile, socketTier, bySocket, groupingRules)
-		result.Partitions = append(result.Partitions, p...)
-	}
-
+	// Build full partition: all devices on the node
 	full := b.buildFullPartition(nodeName, profile, effectiveDevices, groupingRules)
 	if full != nil {
 		result.Partitions = append(result.Partitions, *full)
@@ -214,10 +168,10 @@ func (b *PartitionBuilder) buildNodePartitions(
 	for _, p := range result.Partitions {
 		tierCounts[p.Type]++
 	}
-	klog.Infof("Node %s (profile=%s): computed %d partitions (%d eighth, %d quarter, %d half, %d full)",
+	klog.Infof("Node %s (profile=%s): computed %d partitions (%d pcieRoot, %d numa, %d full)",
 		nodeName, profile, len(result.Partitions),
-		tierCounts[PartitionEighth], tierCounts[PartitionQuarter],
-		tierCounts[PartitionHalf], tierCounts[PartitionFull])
+		tierCounts[PartitionPCIeRoot], tierCounts[PartitionNUMA],
+		tierCounts[PartitionFull])
 
 	return result
 }
@@ -281,28 +235,16 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 	return partitions
 }
 
-// buildProportionalPartitions subdivides each NUMA node into equal partitions.
-// It counts PCIe root groups per NUMA to determine the subdivision factor,
-// then divides all device types proportionally. Shared devices (count=1 per NUMA)
-// get capacity divided via DRAConsumableCapacity.
-func (b *PartitionBuilder) buildProportionalPartitions( //nolint:unparam
+// buildPCIeRootPartitions creates one partition per PCIe root complex.
+// Each partition contains all devices on that PCIe root, plus a proportional
+// share of the parent NUMA node's CPU and memory (equal split by default).
+func (b *PartitionBuilder) buildPCIeRootPartitions(
 	nodeName, profile string,
-	partType PartitionType,
 	byNUMA map[string][]TopologyDevice,
 	byPCIeRoot map[string][]TopologyDevice,
 	allDevices []TopologyDevice,
 ) []PartitionDevice {
-	// Count PCIe root groups per NUMA node to determine subdivision factor
-	numaSubdivisions := make(map[string]int) // NUMA key → number of PCIe roots
-	for _, d := range allDevices {
-		if d.NUMANode == nil || d.PCIeRoot == nil {
-			continue
-		}
-		numaKey := fmt.Sprintf("%d", *d.NUMANode)
-		numaSubdivisions[numaKey]++
-	}
-
-	// Deduplicate: count unique PCIe roots per NUMA
+	// Count unique PCIe roots per NUMA node for CPU/memory division
 	numaPCIeRoots := make(map[string]map[string]bool)
 	for _, d := range allDevices {
 		if d.NUMANode == nil || d.PCIeRoot == nil {
@@ -315,100 +257,60 @@ func (b *PartitionBuilder) buildProportionalPartitions( //nolint:unparam
 		numaPCIeRoots[numaKey][*d.PCIeRoot] = true
 	}
 
-	// For each NUMA node, compute how many quarter partitions to create
-	var partitions []PartitionDevice
-	partIdx := 0
-
-	numaKeys := make([]string, 0, len(byNUMA))
-	for k := range byNUMA {
+	// Sort PCIe root keys for deterministic output
+	pcieKeys := make([]string, 0, len(byPCIeRoot))
+	for k := range byPCIeRoot {
 		if k != "" {
-			numaKeys = append(numaKeys, k)
+			pcieKeys = append(pcieKeys, k)
 		}
 	}
-	sort.Strings(numaKeys)
+	sort.Strings(pcieKeys)
 
-	for _, numaKey := range numaKeys {
-		devices := byNUMA[numaKey]
-		numPCIeRoots := len(numaPCIeRoots[numaKey])
-		if numPCIeRoots <= 1 {
-			continue // no subdivision possible
-		}
+	var partitions []PartitionDevice
+	for idx, pcieKey := range pcieKeys {
+		devices := byPCIeRoot[pcieKey]
+		p := buildPartitionFromDevices(
+			fmt.Sprintf("%s-pcieRoot-%d", nodeName, idx),
+			nodeName, profile, PartitionPCIeRoot, devices,
+		)
 
-		// Count effective devices per driver on this NUMA node,
-		// deduplicating overlapping partitionable devices.
-		driverCounts := EffectiveDeviceCount(devices)
-
-		// Determine subdivision factor: use the number of unique PCIe roots
-		// but only consider drivers with multiple devices (>1).
-		// Drivers with 1 device per NUMA (e.g., CPU, memory) are shared
-		// via DRAConsumableCapacity and don't limit subdivision.
-		subdivisions := numPCIeRoots
-		for driver, count := range driverCounts {
-			if count > 1 && count < subdivisions {
-				klog.V(4).Infof("NUMA %s: reducing subdivisions from %d to %d (limited by %s with %d devices)",
-					numaKey, subdivisions, count, driver, count)
-				subdivisions = count
+		// Add proportional CPU/memory from the parent NUMA node.
+		// Find which NUMA this PCIe root belongs to and how many roots share it.
+		var parentNUMA string
+		for _, d := range devices {
+			if d.NUMANode != nil {
+				parentNUMA = fmt.Sprintf("%d", *d.NUMANode)
+				break
 			}
 		}
-
-		if subdivisions <= 1 {
-			continue
-		}
-
-		// Parse NUMA node ID for topology-aware CEL selectors
-		numaVal, _ := strconv.ParseInt(numaKey, 10, 64)
-
-		// Create subdivided partitions
-		for i := 0; i < subdivisions; i++ {
-			p := PartitionDevice{
-				Name:               fmt.Sprintf("%s-%s-%d", nodeName, partType, partIdx),
-				NodeName:           nodeName,
-				Type:               partType,
-				Profile:            profile,
-				NUMANodes:          []int64{numaVal},
-				DeviceCounts:       make(map[string]int),
-				Devices:            nil, // representative only
-				ExtendedAttributes: make(map[string]DeviceAttributeValue),
-			}
-
-			p.DeviceCapacity = make(map[string]map[string]string)
-			for driver, count := range driverCounts {
-				divided := count / subdivisions
-
-				// Use capacity mode when there aren't enough devices for
-				// exclusive allocation (count < subdivisions) AND devices
-				// publish consumable capacity. This lets multiple partitions
-				// share the same device (e.g., CPU, memory).
-				if count < subdivisions {
-					for _, d := range devices {
-						if baseDriverName(d.DriverName) == driver && len(d.Capacity) > 0 {
-							capPerPartition := make(map[string]string)
-							for capName, capVal := range d.Capacity {
-								dv := divideQuantity(capVal, subdivisions)
-								if dv != "" {
-									capPerPartition[capName] = dv
-								}
+		if parentNUMA != "" {
+			numRoots := len(numaPCIeRoots[parentNUMA])
+			if numRoots > 0 {
+				numaDevices := byNUMA[parentNUMA]
+				for _, d := range numaDevices {
+					driver := baseDriverName(d.DriverName)
+					if len(d.Capacity) > 0 && p.DeviceCounts[driver] == 0 {
+						if p.DeviceCapacity == nil {
+							p.DeviceCapacity = make(map[string]map[string]string)
+						}
+						capPerPartition := make(map[string]string)
+						for capName, capVal := range d.Capacity {
+							dv := divideQuantity(capVal, numRoots)
+							if dv != "" {
+								capPerPartition[capName] = dv
 							}
-							if len(capPerPartition) > 0 {
-								p.DeviceCapacity[driver] = capPerPartition
-								divided = 1
-							}
-							break
+						}
+						if len(capPerPartition) > 0 {
+							p.DeviceCapacity[driver] = capPerPartition
+							p.DeviceCounts[driver] = 1
+							p.Devices = append(p.Devices, d)
 						}
 					}
-					if divided == 0 {
-						divided = 1
-					}
 				}
-				p.DeviceCounts[driver] = divided
 			}
-
-			// Use a subset of devices as representative
-			p.Devices = devices // all same-NUMA devices for attribute lookup
-
-			partitions = append(partitions, p)
-			partIdx++
 		}
+
+		partitions = append(partitions, p)
 	}
 
 	return partitions

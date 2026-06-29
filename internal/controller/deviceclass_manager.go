@@ -111,6 +111,9 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			if len(partition.NUMANodes) > 0 && partition.Type != PartitionFull {
 				key += numaKeySuffix(partition.NUMANodes)
 			}
+			if partition.Type == PartitionPCIeRoot && len(partition.PCIeRoots) > 0 {
+				key += "-" + sanitizeForName(partition.PCIeRoots[0])
+			}
 			if coupling != CouplingNone {
 				key += "-" + string(coupling)
 			}
@@ -152,7 +155,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 // cleanupStaleDeviceClasses removes DeviceClasses that no longer match any partition.
 func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, active map[string]bool) error {
-	labelSelector := fmt.Sprintf("%s/managed=true", CoordinatorDriverName)
+	labelSelector := fmt.Sprintf("%s/managed=true,%s/partitionType", CoordinatorDriverName, CoordinatorDriverName)
 	classes, err := m.client.ResourceV1().DeviceClasses().List(ctx, metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
@@ -190,6 +193,9 @@ func (m *DeviceClassManager) buildDeviceClassFromCache(profile string, partType 
 	nameSuffix := ""
 	if len(representative.NUMANodes) > 0 && partType != PartitionFull {
 		nameSuffix = numaKeySuffix(representative.NUMANodes)
+	}
+	if partType == PartitionPCIeRoot && len(representative.PCIeRoots) > 0 {
+		nameSuffix += "-" + sanitizeForName(representative.PCIeRoots[0])
 	}
 
 	name := m.deviceClassName(profile, partType) + nameSuffix
@@ -329,8 +335,10 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 	coupling := CouplingNone
 	matchRules := m.rules.GetMatchConstraintRules()
 	for _, rule := range matchRules {
-		if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
-			continue
+		if rule.Driver != "" {
+			if _, ok := representative.DeviceCounts[rule.Driver]; !ok {
+				continue
+			}
 		}
 
 		enforcement := rule.Enforcement
