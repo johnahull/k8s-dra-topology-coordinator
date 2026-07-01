@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -225,6 +226,14 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 			fmt.Sprintf("%s-%s-%d", nodeName, partType, i),
 			nodeName, profile, partType, devices,
 		)
+		// For NUMA partitions, override NUMANodes to the group key only.
+		// SLIT-duplicated devices bring their primary NUMA, but the partition
+		// represents a single NUMA node's view of available devices.
+		if partType == PartitionNUMA {
+			if numaID, err := strconv.ParseInt(key, 10, 64); err == nil {
+				p.NUMANodes = []int64{numaID}
+			}
+		}
 		partitions = append(partitions, p)
 	}
 
