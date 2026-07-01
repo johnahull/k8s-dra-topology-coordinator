@@ -52,9 +52,10 @@ type TopologyDevice struct {
 	PoolName string
 
 	// Standard topology attributes
-	NUMANode  *int64  // Primary NUMA node (first element of NUMANodes, or scalar value)
-	NUMANodes []int64 // Full NUMA node list from IntValues (SLIT-aware, physical first)
-	PCIeRoot  *string
+	NUMANode  *int64   // Primary NUMA node (first element of NUMANodes, or scalar value)
+	NUMANodes []int64  // Full NUMA node list from IntValues (SLIT-aware, physical first)
+	PCIeRoot  *string  // Primary PCIe root (first element of PCIeRoots, or scalar value)
+	PCIeRoots []string // Full PCIe root list from StringValues (multi-root devices like CPUs)
 	Socket    *int64
 
 	// Extended attributes from topology rules (attribute qualified name -> value).
@@ -391,6 +392,10 @@ func (td TopologyDevice) deepCopy() TopologyDevice {
 		v := *td.PCIeRoot
 		cp.PCIeRoot = &v
 	}
+	if len(td.PCIeRoots) > 0 {
+		cp.PCIeRoots = make([]string, len(td.PCIeRoots))
+		copy(cp.PCIeRoots, td.PCIeRoots)
+	}
 	if td.Socket != nil {
 		v := *td.Socket
 		cp.Socket = &v
@@ -485,6 +490,9 @@ func deviceAttributeValues(dev TopologyDevice, attribute string) []string {
 			return []string{fmt.Sprintf("%d", *dev.NUMANode)}
 		}
 	case AttrPCIeRoot:
+		if len(dev.PCIeRoots) > 0 {
+			return dev.PCIeRoots
+		}
 		if dev.PCIeRoot != nil {
 			return []string{*dev.PCIeRoot}
 		}
@@ -528,8 +536,12 @@ func (m *TopologyModel) extractTopologyDevice(
 			}
 			continue
 		case AttrPCIeRoot:
-			if attr.StringValue != nil {
+			if len(attr.StringValues) > 0 {
+				td.PCIeRoot = &attr.StringValues[0]
+				td.PCIeRoots = attr.StringValues
+			} else if attr.StringValue != nil {
 				td.PCIeRoot = attr.StringValue
+				td.PCIeRoots = []string{*attr.StringValue}
 			}
 			continue
 		case AttrSocket:
