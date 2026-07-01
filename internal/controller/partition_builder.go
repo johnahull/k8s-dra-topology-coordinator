@@ -195,7 +195,12 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 
 	// Validate that extended grouping rules are satisfied.
 	// Build a new map to avoid mutating validGroups during iteration.
+	// Skip NUMA-mapped rules for NUMA partitions — SLIT-aware grouping
+	// already placed devices correctly; re-splitting would undo it.
 	for _, rule := range groupingRules {
+		if partType == PartitionNUMA && rule.MapsTo == "numaNode" {
+			continue
+		}
 		splitGroups := make(map[string][]TopologyDevice)
 		for key, devices := range validGroups {
 			if !devicesShareAttribute(devices, rule.Attribute) {
