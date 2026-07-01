@@ -69,6 +69,22 @@ type AlignmentConfig struct {
 	Enforcement EnforcementMode `json:"enforcement"`
 }
 
+// profilePartition tracks a unique partition instance for DeviceClass generation.
+type profilePartition struct {
+	profile        string
+	partType       PartitionType
+	representative PartitionDevice
+	cachedConfig   PartitionConfig
+	cachedCoupling CouplingLevel
+	count          int
+}
+
+// aggregateKey groups partitions by profile and type for aggregate DeviceClasses.
+type aggregateKey struct {
+	profile  string
+	partType PartitionType
+}
+
 // DeviceClassManager creates and manages DeviceClass objects based on discovered partition types.
 type DeviceClassManager struct {
 	client     kubernetes.Interface
@@ -93,15 +109,6 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
 	// Collect all unique partition types and their profiles.
 	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
-	type profilePartition struct {
-		profile        string
-		partType       PartitionType
-		representative PartitionDevice
-		cachedConfig   PartitionConfig
-		cachedCoupling CouplingLevel
-		count          int
-	}
-
 	seen := make(map[string]*profilePartition)
 	for _, result := range results {
 		for _, partition := range result.Partitions {
@@ -145,10 +152,6 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
 	// No NUMA/PCIe selectors — the scheduler picks placement.
-	type aggregateKey struct {
-		profile  string
-		partType PartitionType
-	}
 	aggregates := make(map[aggregateKey]*profilePartition)
 	for _, pp := range seen {
 		if pp.partType == PartitionFull {
@@ -193,33 +196,28 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			pcieRootCount++
 		}
 	}
+
+	// Compute tier names once, reused for both emission and cleanup.
+	tierNames := make(map[aggregateKey]string)
 	if pcieRootCount > 0 {
 		for ak, pp := range aggregates {
-			var rootsInPartition int
-			switch ak.partType {
-			case PartitionPCIeRoot:
-				rootsInPartition = 1
-			case PartitionNUMA:
-				rootsInPartition = countPCIeRootsInNUMA(allPartitions, ak.profile, pp.representative.NUMANodes)
-				if rootsInPartition == 0 {
-					rootsInPartition = pcieRootCount / pp.count
-				}
-			default:
-				continue
+			tierName := computeTierName(ak.partType, pp, allPartitions, ak.profile, pcieRootCount)
+			if tierName != "" {
+				tierNames[ak] = tierName
 			}
-			tierName := fractionToTierName(rootsInPartition, pcieRootCount)
-			if tierName == "" || tierName == "full" || tierName == string(ak.partType) {
-				continue
-			}
-			aggRep := pp.representative
-			aggRep.NUMANodes = nil
-			aggRep.PCIeRoots = nil
-			dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
-			dc.Name = tierName
-			dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
-			if err := m.publishDeviceClass(ctx, dc); err != nil {
-				return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
-			}
+		}
+	}
+
+	for ak, tierName := range tierNames {
+		pp := aggregates[ak]
+		aggRep := pp.representative
+		aggRep.NUMANodes = nil
+		aggRep.PCIeRoots = nil
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		dc.Name = tierName
+		dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
 		}
 	}
 
@@ -232,26 +230,8 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		aggKey := truncateLabel(ak.profile) + "-" + string(ak.partType)
 		activeKeys[aggKey] = true
 	}
-	// Mark tier-named aggregates as active
-	if pcieRootCount > 0 {
-		for ak, pp := range aggregates {
-			var rootsInPartition int
-			switch ak.partType {
-			case PartitionPCIeRoot:
-				rootsInPartition = 1
-			case PartitionNUMA:
-				rootsInPartition = countPCIeRootsInNUMA(allPartitions, ak.profile, pp.representative.NUMANodes)
-				if rootsInPartition == 0 {
-					rootsInPartition = pcieRootCount / pp.count
-				}
-			default:
-				continue
-			}
-			tierName := fractionToTierName(rootsInPartition, pcieRootCount)
-			if tierName != "" && tierName != "full" && tierName != string(ak.partType) {
-				activeKeys[truncateLabel(ak.profile)+"-"+tierName] = true
-			}
-		}
+	for ak, tierName := range tierNames {
+		activeKeys[truncateLabel(ak.profile)+"-"+tierName] = true
 	}
 	if err := m.cleanupStaleDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale DeviceClasses: %v", err)
@@ -259,6 +239,28 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	klog.Infof("Synced %d DeviceClasses", len(seen))
 	return nil
+}
+
+// computeTierName returns the human-readable tier name (eighth, quarter, half, etc.)
+// for a given aggregate partition type, or "" if no well-known name applies.
+func computeTierName(partType PartitionType, pp *profilePartition, allPartitions []PartitionDevice, profile string, pcieRootCount int) string {
+	var rootsInPartition int
+	switch partType {
+	case PartitionPCIeRoot:
+		rootsInPartition = 1
+	case PartitionNUMA:
+		rootsInPartition = countPCIeRootsInNUMA(allPartitions, profile, pp.representative.NUMANodes)
+		if rootsInPartition == 0 {
+			rootsInPartition = pcieRootCount / pp.count
+		}
+	default:
+		return ""
+	}
+	tierName := fractionToTierName(rootsInPartition, pcieRootCount)
+	if tierName == "" || tierName == "full" || tierName == string(partType) {
+		return ""
+	}
+	return tierName
 }
 
 // countPCIeRootsInNUMA counts how many PCIe root partitions share NUMA nodes
@@ -300,14 +302,23 @@ func (m *DeviceClassManager) cleanupStaleDeviceClasses(ctx context.Context, acti
 	for _, dc := range classes.Items {
 		profile := dc.Labels[CoordinatorDriverName+"/profile"]
 		partType := dc.Labels[CoordinatorDriverName+"/partitionType"]
+		tierName := dc.Labels[CoordinatorDriverName+"/tierName"]
 		numa := dc.Labels[CoordinatorDriverName+"/numa"]
 		coupling := dc.Labels[CoordinatorDriverName+"/coupling"]
-		key := profile + "-" + partType
-		if numa != "" {
-			key += "-" + numa
-		}
-		if coupling != "" {
-			key += "-" + coupling
+
+		// Tier-named aggregates use profile-tierName as their key;
+		// regular partitions use profile-partitionType[-numa][-coupling].
+		var key string
+		if tierName != "" {
+			key = profile + "-" + tierName
+		} else {
+			key = profile + "-" + partType
+			if numa != "" {
+				key += "-" + numa
+			}
+			if coupling != "" {
+				key += "-" + coupling
+			}
 		}
 		if _, exists := active[key]; !exists {
 			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
@@ -1038,27 +1049,27 @@ func sanitizeDNSLabel(s string) string {
 	return sanitized
 }
 
+type frac struct{ n, d int }
+
+var fractionNames = map[frac]string{
+	{1, 16}: "sixteenth",
+	{1, 12}: "twelfth",
+	{1, 8}:  "eighth",
+	{1, 6}:  "sixth",
+	{1, 4}:  "quarter",
+	{1, 3}:  "third",
+	{1, 2}:  "half",
+	{1, 1}:  "full",
+}
+
 // fractionToTierName maps a reduced fraction (numerator/denominator) to a
 // human-readable tier name. Returns "" for fractions without a well-known name.
 func fractionToTierName(numerator, denominator int) string {
-	if denominator == 0 {
+	if denominator == 0 || numerator == 0 {
 		return ""
 	}
 	g := gcd(numerator, denominator)
-	n, d := numerator/g, denominator/g
-
-	type frac struct{ n, d int }
-	names := map[frac]string{
-		{1, 16}: "sixteenth",
-		{1, 12}: "twelfth",
-		{1, 8}:  "eighth",
-		{1, 6}:  "sixth",
-		{1, 4}:  "quarter",
-		{1, 3}:  "third",
-		{1, 2}:  "half",
-		{1, 1}:  "full",
-	}
-	return names[frac{n, d}]
+	return fractionNames[frac{numerator / g, denominator / g}]
 }
 
 func gcd(a, b int) int {
