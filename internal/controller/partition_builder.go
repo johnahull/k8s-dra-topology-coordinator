@@ -229,6 +229,22 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 			fmt.Sprintf("%s-%s-%d", nodeName, partType, i),
 			nodeName, profile, partType, devices,
 		)
+
+		// Enrich with capacity from shared devices (CPU, memory). For NUMA
+		// partitions the full capacity of each device applies (no division,
+		// unlike pcieRoot which splits across roots).
+		for _, d := range devices {
+			driver := baseDriverName(d.DriverName)
+			if len(d.Capacity) > 0 {
+				if p.DeviceCapacity == nil {
+					p.DeviceCapacity = make(map[string]map[string]string)
+				}
+				if _, has := p.DeviceCapacity[driver]; !has {
+					p.DeviceCapacity[driver] = d.Capacity
+				}
+			}
+		}
+
 		partitions = append(partitions, p)
 	}
 
