@@ -152,16 +152,19 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
 	// No NUMA/PCIe selectors — the scheduler picks placement.
-	// Merge device counts across all partitions of the same type so the
-	// aggregate includes all device types (e.g., NICs only exist on some
-	// PCIe roots, NVMe on others).
+	// Use intersection of device counts: only include drivers present on
+	// ALL partitions of the same type. This ensures the aggregate is
+	// schedulable on any instance. Asymmetric devices (NICs on some roots
+	// but not others) are handled via grouping DeviceClasses instead.
 	type aggregateState struct {
-		profile      string
-		partType     PartitionType
-		mergedCounts map[string]int
-		mergedCap    map[string]map[string]string
-		devices      []TopologyDevice
-		count        int
+		profile    string
+		partType   PartitionType
+		driverSeen map[string]int // driver → number of partitions that have it
+		minCounts  map[string]int
+		minCap     map[string]map[string]string
+		devices    []TopologyDevice
+		total      int // total partitions of this type
+		count      int // sum of pp.count
 	}
 	aggStates := make(map[aggregateKey]*aggregateState)
 	for _, pp := range seen {
@@ -171,45 +174,62 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
 		if existing, ok := aggStates[ak]; ok {
 			existing.count += pp.count
+			existing.total++
 			for driver, count := range pp.representative.DeviceCounts {
-				if _, has := existing.mergedCounts[driver]; !has {
-					existing.mergedCounts[driver] = count
-					if pp.representative.DeviceCapacity != nil {
-						if cap, ok := pp.representative.DeviceCapacity[driver]; ok {
-							existing.mergedCap[driver] = cap
-						}
+				existing.driverSeen[driver]++
+				if prev, has := existing.minCounts[driver]; !has || count < prev {
+					existing.minCounts[driver] = count
+				}
+				if pp.representative.DeviceCapacity != nil {
+					if cap, ok := pp.representative.DeviceCapacity[driver]; ok {
+						existing.minCap[driver] = cap
 					}
 				}
 			}
 			existing.devices = append(existing.devices, pp.representative.Devices...)
 		} else {
-			merged := make(map[string]int)
+			driverSeen := make(map[string]int)
+			minCounts := make(map[string]int)
 			for k, v := range pp.representative.DeviceCounts {
-				merged[k] = v
+				driverSeen[k] = 1
+				minCounts[k] = v
 			}
-			mergedCap := make(map[string]map[string]string)
+			minCap := make(map[string]map[string]string)
 			if pp.representative.DeviceCapacity != nil {
 				for k, v := range pp.representative.DeviceCapacity {
-					mergedCap[k] = v
+					minCap[k] = v
 				}
 			}
 			aggStates[ak] = &aggregateState{
-				profile:      pp.profile,
-				partType:     pp.partType,
-				mergedCounts: merged,
-				mergedCap:    mergedCap,
-				devices:      append([]TopologyDevice{}, pp.representative.Devices...),
-				count:        pp.count,
+				profile:    pp.profile,
+				partType:   pp.partType,
+				driverSeen: driverSeen,
+				minCounts:  minCounts,
+				minCap:     minCap,
+				devices:    append([]TopologyDevice{}, pp.representative.Devices...),
+				total:      1,
+				count:      pp.count,
 			}
 		}
 	}
 	aggregates := make(map[aggregateKey]*profilePartition)
 	for ak, state := range aggStates {
+		// Intersection: only keep drivers present on all partitions.
+		intersectedCounts := make(map[string]int)
+		intersectedCap := make(map[string]map[string]string)
+		for driver, seen := range state.driverSeen {
+			if seen == state.total {
+				intersectedCounts[driver] = state.minCounts[driver]
+				if cap, ok := state.minCap[driver]; ok {
+					intersectedCap[driver] = cap
+				}
+			}
+		}
 		mergedRep := PartitionDevice{
 			Profile:        state.profile,
 			Type:           state.partType,
-			DeviceCounts:   state.mergedCounts,
-			DeviceCapacity: state.mergedCap,
+			DeviceCounts:   intersectedCounts,
+			DeviceCapacity: intersectedCap,
 			Devices:        state.devices,
 		}
 		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep)
