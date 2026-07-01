@@ -980,5 +980,5 @@ func TestDeviceClassManager_SLITReachability(t *testing.T) {
 		subResources[sr.DeviceClass] = sr.Count
 	}
 	assert.Equal(t, 1, subResources["gpu.amd.com"], "GPU count should be 1 (not inflated)")
-	assert.Equal(t, 4, subResources["sriov"], "NIC should be included via SLIT reachability")
+	assert.Equal(t, 1, subResources["sriov"], "NIC count should be 1 per NUMA (4 VFs / 4 sharing NUMAs)")
 }

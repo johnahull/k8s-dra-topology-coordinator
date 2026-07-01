@@ -228,8 +228,23 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		intersectedCounts := make(map[string]int)
 		intersectedCap := make(map[string]map[string]string)
 		for driver, seen := range state.driverSeen {
-			if seen == state.total || (ak.partType == PartitionNUMA && isDriverReachableToAll(driver, state.partitionNUMAs, state.devices)) {
+			if seen == state.total {
 				intersectedCounts[driver] = state.minCounts[driver]
+				if cap, ok := state.minCap[driver]; ok {
+					intersectedCap[driver] = cap
+				}
+			} else if ak.partType == PartitionNUMA && isDriverReachableToAll(driver, state.partitionNUMAs, state.devices) {
+				// SLIT-reachable driver: divide total count by the number of
+				// NUMA nodes sharing access to get the per-partition share.
+				sharingNUMAs := countSharingNUMAs(driver, state.partitionNUMAs, state.devices)
+				count := state.minCounts[driver]
+				if sharingNUMAs > 1 {
+					count = count / sharingNUMAs
+				}
+				if count < 1 {
+					count = 1
+				}
+				intersectedCounts[driver] = count
 				if cap, ok := state.minCap[driver]; ok {
 					intersectedCap[driver] = cap
 				}
@@ -375,6 +390,32 @@ func isDriverReachableToAll(driver string, partitionNUMAs []int64, devices []Top
 		}
 	}
 	return true
+}
+
+// countSharingNUMAs returns how many partition NUMA nodes share access to a
+// driver's devices via SLIT. This is the average NUMANodes list length across
+// the driver's devices, used to divide device counts proportionally.
+func countSharingNUMAs(driver string, partitionNUMAs []int64, devices []TopologyDevice) int {
+	partSet := make(map[int64]bool, len(partitionNUMAs))
+	for _, n := range partitionNUMAs {
+		partSet[n] = true
+	}
+	maxSharing := 0
+	for _, dev := range devices {
+		if baseDriverName(dev.DriverName) != driver {
+			continue
+		}
+		sharing := 0
+		for _, n := range dev.NUMANodes {
+			if partSet[n] {
+				sharing++
+			}
+		}
+		if sharing > maxSharing {
+			maxSharing = sharing
+		}
+	}
+	return maxSharing
 }
 
 // countPCIeRootsInNUMA counts how many PCIe root partitions share NUMA nodes
