@@ -228,7 +228,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		intersectedCounts := make(map[string]int)
 		intersectedCap := make(map[string]map[string]string)
 		for driver, seen := range state.driverSeen {
-			if seen == state.total || isDriverReachableToAll(driver, state.partitionNUMAs, state.devices) {
+			if seen == state.total || (ak.partType == PartitionNUMA && isDriverReachableToAll(driver, state.partitionNUMAs, state.devices)) {
 				intersectedCounts[driver] = state.minCounts[driver]
 				if cap, ok := state.minCap[driver]; ok {
 					intersectedCap[driver] = cap
