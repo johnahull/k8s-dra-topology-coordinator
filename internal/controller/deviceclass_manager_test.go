@@ -909,3 +909,76 @@ func TestDeviceClassManager_TierNamedAggregates(t *testing.T) {
 		}
 	}
 }
+
+func TestDeviceClassManager_SLITReachability(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// 4 NUMA nodes, 1 GPU each (scalar NUMA), NICs only on NUMA 0 with SLIT [0,1,2,3]
+	var partitions []PartitionDevice
+	for i := 0; i < 4; i++ {
+		p := PartitionDevice{
+			Name:         fmt.Sprintf("node-1-numa-%d", i),
+			Type:         PartitionNUMA,
+			Profile:      "test-slit",
+			NUMANodes:    []int64{int64(i)},
+			DeviceCounts: map[string]int{"gpu.amd.com": 1},
+			Devices: []TopologyDevice{
+				{DriverName: "gpu.amd.com", NUMANode: intPtr(int64(i)), NUMANodes: []int64{int64(i)}},
+			},
+		}
+		// Add NICs only on NUMA 0, but reachable to 0-3 via SLIT
+		if i == 0 {
+			p.DeviceCounts["sriov"] = 4
+			for j := 0; j < 4; j++ {
+				p.Devices = append(p.Devices, TopologyDevice{
+					DriverName: "sriov",
+					NUMANode:   intPtr(0),
+					NUMANodes:  []int64{0, 1, 2, 3},
+				})
+			}
+		}
+		partitions = append(partitions, p)
+	}
+	partitions = append(partitions, PartitionDevice{
+		Name:         "node-1-full",
+		Type:         PartitionFull,
+		Profile:      "test-slit",
+		DeviceCounts: map[string]int{"gpu.amd.com": 4, "sriov": 4},
+	})
+
+	results := []PartitionResult{{
+		NodeName:   "node-1",
+		Profile:    "test-slit",
+		Partitions: partitions,
+	}}
+
+	err := manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+
+	// Find the numa aggregate
+	var numaAgg *resourcev1.DeviceClass
+	for i := range classes.Items {
+		if classes.Items[i].Name == "numa" {
+			numaAgg = &classes.Items[i]
+			break
+		}
+	}
+	require.NotNil(t, numaAgg, "should have a 'numa' aggregate DeviceClass")
+
+	var config PartitionConfig
+	err = json.Unmarshal(numaAgg.Spec.Config[0].Opaque.Parameters.Raw, &config)
+	require.NoError(t, err)
+
+	// NUMA aggregate should include NIC via SLIT reachability
+	subResources := make(map[string]int)
+	for _, sr := range config.SubResources {
+		subResources[sr.DeviceClass] = sr.Count
+	}
+	assert.Equal(t, 1, subResources["gpu.amd.com"], "GPU count should be 1 (not inflated)")
+	assert.Equal(t, 4, subResources["sriov"], "NIC should be included via SLIT reachability")
+}

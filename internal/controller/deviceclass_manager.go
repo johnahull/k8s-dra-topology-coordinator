@@ -157,14 +157,15 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	// schedulable on any instance. Asymmetric devices (NICs on some roots
 	// but not others) are handled via grouping DeviceClasses instead.
 	type aggregateState struct {
-		profile    string
-		partType   PartitionType
-		driverSeen map[string]int // driver → number of partitions that have it
-		minCounts  map[string]int
-		minCap     map[string]map[string]string
-		devices    []TopologyDevice
-		total      int // total partitions of this type
-		count      int // sum of pp.count
+		profile        string
+		partType       PartitionType
+		driverSeen     map[string]int // driver → number of partitions that have it
+		minCounts      map[string]int
+		minCap         map[string]map[string]string
+		devices        []TopologyDevice
+		partitionNUMAs []int64 // primary NUMA node of each partition
+		total          int     // total partitions of this type
+		count          int     // sum of pp.count
 	}
 	aggStates := make(map[aggregateKey]*aggregateState)
 	for _, pp := range seen {
@@ -175,6 +176,9 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		if existing, ok := aggStates[ak]; ok {
 			existing.count += pp.count
 			existing.total++
+			if len(pp.representative.NUMANodes) > 0 {
+				existing.partitionNUMAs = append(existing.partitionNUMAs, pp.representative.NUMANodes[0])
+			}
 			for driver, count := range pp.representative.DeviceCounts {
 				existing.driverSeen[driver]++
 				if prev, has := existing.minCounts[driver]; !has || count < prev {
@@ -200,25 +204,31 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 					minCap[k] = v
 				}
 			}
+			var partNUMAs []int64
+			if len(pp.representative.NUMANodes) > 0 {
+				partNUMAs = []int64{pp.representative.NUMANodes[0]}
+			}
 			aggStates[ak] = &aggregateState{
-				profile:    pp.profile,
-				partType:   pp.partType,
-				driverSeen: driverSeen,
-				minCounts:  minCounts,
-				minCap:     minCap,
-				devices:    append([]TopologyDevice{}, pp.representative.Devices...),
-				total:      1,
-				count:      pp.count,
+				profile:        pp.profile,
+				partType:       pp.partType,
+				driverSeen:     driverSeen,
+				minCounts:      minCounts,
+				minCap:         minCap,
+				devices:        append([]TopologyDevice{}, pp.representative.Devices...),
+				partitionNUMAs: partNUMAs,
+				total:          1,
+				count:          pp.count,
 			}
 		}
 	}
 	aggregates := make(map[aggregateKey]*profilePartition)
 	for ak, state := range aggStates {
-		// Intersection: only keep drivers present on all partitions.
+		// Intersection: keep drivers present on all partitions, or reachable
+		// to all partitions via SLIT-distance NUMANodes lists.
 		intersectedCounts := make(map[string]int)
 		intersectedCap := make(map[string]map[string]string)
 		for driver, seen := range state.driverSeen {
-			if seen == state.total {
+			if seen == state.total || isDriverReachableToAll(driver, state.partitionNUMAs, state.devices) {
 				intersectedCounts[driver] = state.minCounts[driver]
 				if cap, ok := state.minCap[driver]; ok {
 					intersectedCap[driver] = cap
@@ -334,6 +344,37 @@ func computeTierName(partType PartitionType, pp *profilePartition, allPartitions
 		return ""
 	}
 	return tierName
+}
+
+// isDriverReachableToAll checks if a driver's devices are reachable to all
+// partition NUMA nodes via SLIT-distance NUMANodes lists. A device is reachable
+// to a partition if the partition's NUMA node appears in the device's NUMANodes
+// list (indicating equidistant access, e.g., same socket).
+func isDriverReachableToAll(driver string, partitionNUMAs []int64, devices []TopologyDevice) bool {
+	if len(partitionNUMAs) == 0 {
+		return false
+	}
+	for _, partNUMA := range partitionNUMAs {
+		reachable := false
+		for _, dev := range devices {
+			if baseDriverName(dev.DriverName) != driver {
+				continue
+			}
+			for _, devNUMA := range dev.NUMANodes {
+				if devNUMA == partNUMA {
+					reachable = true
+					break
+				}
+			}
+			if reachable {
+				break
+			}
+		}
+		if !reachable {
+			return false
+		}
+	}
+	return true
 }
 
 // countPCIeRootsInNUMA counts how many PCIe root partitions share NUMA nodes
