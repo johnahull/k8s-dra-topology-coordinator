@@ -537,7 +537,10 @@ func (m *TopologyModel) extractTopologyDevice(
 			continue
 		case AttrPCIeRoot:
 			if len(attr.StringValues) > 0 {
-				td.PCIeRoot = &attr.StringValues[0]
+				// List-type pcieRoot (e.g., CPU driver listing nearby roots).
+				// Store in PCIeRoots for alignment matching but don't set the
+				// scalar PCIeRoot — list devices aren't PCI devices and should
+				// not create new pcieRoot partitions.
 				td.PCIeRoots = attr.StringValues
 			} else if attr.StringValue != nil {
 				td.PCIeRoot = attr.StringValue
