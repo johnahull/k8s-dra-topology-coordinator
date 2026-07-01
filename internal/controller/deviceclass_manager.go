@@ -135,8 +135,91 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	// Create/update a DeviceClass for each profile+partitionType
 	for _, pp := range seen {
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling, pp.count)
+		if pp.partType == PartitionFull {
+			dc.Name = string(PartitionFull)
+		}
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
+	// No NUMA/PCIe selectors — the scheduler picks placement.
+	type aggregateKey struct {
+		profile  string
+		partType PartitionType
+	}
+	aggregates := make(map[aggregateKey]*profilePartition)
+	for _, pp := range seen {
+		if pp.partType == PartitionFull {
+			continue
+		}
+		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
+		if existing, ok := aggregates[ak]; ok {
+			existing.count += pp.count
+		} else {
+			aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
+			aggregates[ak] = &profilePartition{
+				profile:        pp.profile,
+				partType:       pp.partType,
+				representative: pp.representative,
+				cachedConfig:   aggConfig,
+				cachedCoupling: aggCoupling,
+				count:          pp.count,
+			}
+		}
+	}
+	for _, pp := range aggregates {
+		aggRep := pp.representative
+		aggRep.NUMANodes = nil
+		aggRep.PCIeRoots = nil
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		dc.Name = string(pp.partType)
+		if err := m.publishDeviceClass(ctx, dc); err != nil {
+			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+		}
+	}
+
+	// Emit tier-named aggregate DeviceClasses (eighth, quarter, half, etc.)
+	// based on the fraction of total PCIe roots each partition type covers.
+	// Collect all partitions for countPCIeRootsInNUMA lookups.
+	var allPartitions []PartitionDevice
+	for _, result := range results {
+		allPartitions = append(allPartitions, result.Partitions...)
+	}
+	pcieRootCount := 0
+	for _, pp := range seen {
+		if pp.partType == PartitionPCIeRoot {
+			pcieRootCount++
+		}
+	}
+	if pcieRootCount > 0 {
+		for ak, pp := range aggregates {
+			var rootsInPartition int
+			switch ak.partType {
+			case PartitionPCIeRoot:
+				rootsInPartition = 1
+			case PartitionNUMA:
+				rootsInPartition = countPCIeRootsInNUMA(allPartitions, ak.profile, pp.representative.NUMANodes)
+				if rootsInPartition == 0 {
+					rootsInPartition = pcieRootCount / pp.count
+				}
+			default:
+				continue
+			}
+			tierName := fractionToTierName(rootsInPartition, pcieRootCount)
+			if tierName == "" || tierName == "full" || tierName == string(ak.partType) {
+				continue
+			}
+			aggRep := pp.representative
+			aggRep.NUMANodes = nil
+			aggRep.PCIeRoots = nil
+			dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+			dc.Name = tierName
+			dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
+			if err := m.publishDeviceClass(ctx, dc); err != nil {
+				return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
+			}
 		}
 	}
 
@@ -145,12 +228,63 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	for key := range seen {
 		activeKeys[key] = true
 	}
+	for ak := range aggregates {
+		aggKey := truncateLabel(ak.profile) + "-" + string(ak.partType)
+		activeKeys[aggKey] = true
+	}
+	// Mark tier-named aggregates as active
+	if pcieRootCount > 0 {
+		for ak, pp := range aggregates {
+			var rootsInPartition int
+			switch ak.partType {
+			case PartitionPCIeRoot:
+				rootsInPartition = 1
+			case PartitionNUMA:
+				rootsInPartition = countPCIeRootsInNUMA(allPartitions, ak.profile, pp.representative.NUMANodes)
+				if rootsInPartition == 0 {
+					rootsInPartition = pcieRootCount / pp.count
+				}
+			default:
+				continue
+			}
+			tierName := fractionToTierName(rootsInPartition, pcieRootCount)
+			if tierName != "" && tierName != "full" && tierName != string(ak.partType) {
+				activeKeys[truncateLabel(ak.profile)+"-"+tierName] = true
+			}
+		}
+	}
 	if err := m.cleanupStaleDeviceClasses(ctx, activeKeys); err != nil {
 		klog.Errorf("Failed to cleanup stale DeviceClasses: %v", err)
 	}
 
 	klog.Infof("Synced %d DeviceClasses", len(seen))
 	return nil
+}
+
+// countPCIeRootsInNUMA counts how many PCIe root partitions share NUMA nodes
+// with the given NUMA node set. Used to determine what fraction of the node
+// a NUMA partition represents.
+func countPCIeRootsInNUMA(partitions []PartitionDevice, profile string, numaNodes []int64) int {
+	if len(numaNodes) == 0 {
+		return 0
+	}
+	numaSet := make(map[int64]bool, len(numaNodes))
+	for _, n := range numaNodes {
+		numaSet[n] = true
+	}
+	count := 0
+	for _, p := range partitions {
+		if p.Profile != profile || p.Type != PartitionPCIeRoot {
+			continue
+		}
+		for _, n := range p.NUMANodes {
+			if numaSet[n] {
+				count++
+				break
+			}
+		}
+	}
+	return count
 }
 
 // cleanupStaleDeviceClasses removes DeviceClasses that no longer match any partition.
@@ -902,6 +1036,36 @@ func sanitizeDNSLabel(s string) string {
 	}
 
 	return sanitized
+}
+
+// fractionToTierName maps a reduced fraction (numerator/denominator) to a
+// human-readable tier name. Returns "" for fractions without a well-known name.
+func fractionToTierName(numerator, denominator int) string {
+	if denominator == 0 {
+		return ""
+	}
+	g := gcd(numerator, denominator)
+	n, d := numerator/g, denominator/g
+
+	type frac struct{ n, d int }
+	names := map[frac]string{
+		{1, 16}: "sixteenth",
+		{1, 12}: "twelfth",
+		{1, 8}:  "eighth",
+		{1, 6}:  "sixth",
+		{1, 4}:  "quarter",
+		{1, 3}:  "third",
+		{1, 2}:  "half",
+		{1, 1}:  "full",
+	}
+	return names[frac{n, d}]
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // partitionModeAttributeSuffixes lists attribute name suffixes that indicate

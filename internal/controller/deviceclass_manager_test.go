@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,8 +66,8 @@ func TestDeviceClassManager_SyncDeviceClasses(t *testing.T) {
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 
-	// Should have 2 classes: one pcieroot, one numa
-	assert.Len(t, classes.Items, 2)
+	// Should have 4 classes: pcieroot + numa (per-instance) + pcieroot + numa (aggregates)
+	assert.Len(t, classes.Items, 4)
 
 	// Verify labels
 	for _, dc := range classes.Items {
@@ -114,7 +115,8 @@ func TestDeviceClassManager_DeviceClassContents(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	dc := findSpecificDC(classes.Items)
 
@@ -212,7 +214,8 @@ func TestDeviceClassManager_MixedPCIAndNonPCIDrivers(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -274,7 +277,8 @@ func TestDeviceClassManager_WithMatchConstraintRules(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -328,7 +332,8 @@ func TestDeviceClassManager_EnforcementPropagation(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -398,7 +403,8 @@ func TestDeviceClassManager_PerDriverCELSelectors(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	var config PartitionConfig
 	err = json.Unmarshal(findSpecificDC(classes.Items).Spec.Config[0].Opaque.Parameters.Raw, &config)
@@ -511,7 +517,8 @@ func TestDeviceClassManager_CleansUpStaleClasses(t *testing.T) {
 	require.NoError(t, err)
 
 	classes, _ := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
-	assert.Len(t, classes.Items, 2, "should have 2 DeviceClasses after first sync")
+	// 2 per-instance + 2 aggregates = 4
+	assert.Len(t, classes.Items, 4, "should have 4 DeviceClasses after first sync")
 
 	// Second sync: only pcieroot remains (GPUs removed, no numa partition anymore)
 	results = []PartitionResult{
@@ -527,8 +534,8 @@ func TestDeviceClassManager_CleansUpStaleClasses(t *testing.T) {
 	require.NoError(t, err)
 
 	classes, _ = client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
-	assert.Len(t, classes.Items, 1, "stale numa DeviceClass should be cleaned up")
-	assert.Contains(t, findSpecificDC(classes.Items).Name, "pcieroot")
+	// 1 per-instance + 1 aggregate = 2
+	assert.Len(t, classes.Items, 2, "stale numa DeviceClasses should be cleaned up")
 }
 
 func TestDeviceClassManager_FallbackCouplingTight(t *testing.T) {
@@ -577,7 +584,8 @@ func TestDeviceClassManager_FallbackCouplingTight(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	// Should have tight coupling label
 	assert.Equal(t, "tight", findSpecificDC(classes.Items).Labels[CoordinatorDriverName+"/coupling"])
@@ -642,7 +650,8 @@ func TestDeviceClassManager_FallbackCouplingLoose(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	// Should have loose coupling label
 	assert.Equal(t, "loose", findSpecificDC(classes.Items).Labels[CoordinatorDriverName+"/coupling"])
@@ -720,15 +729,22 @@ func TestDeviceClassManager_FallbackMixedCoupling(t *testing.T) {
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 
-	// Should have 2 DeviceClasses: one tight, one loose
-	assert.Len(t, classes.Items, 2, "mixed coupling should produce 2 DeviceClasses")
+	// 2 per-instance (tight+loose) + 1 aggregate + 1 tier ("half" = 1/2) = 4
+	assert.Len(t, classes.Items, 4, "mixed coupling should produce 4 DeviceClasses")
 
 	couplings := map[string]bool{}
+	var tierNames []string
 	for _, dc := range classes.Items {
-		couplings[dc.Labels[CoordinatorDriverName+"/coupling"]] = true
+		if c := dc.Labels[CoordinatorDriverName+"/coupling"]; c != "" {
+			couplings[c] = true
+		}
+		if tn := dc.Labels[CoordinatorDriverName+"/tierName"]; tn != "" {
+			tierNames = append(tierNames, tn)
+		}
 	}
 	assert.True(t, couplings["tight"], "should have a tight DeviceClass")
 	assert.True(t, couplings["loose"], "should have a loose DeviceClass")
+	assert.Contains(t, tierNames, "half", "should have a 'half' tier alias (2 pcieroot partitions → 1/2)")
 }
 
 func TestDeviceClassManager_NoFallbackAttribute(t *testing.T) {
@@ -768,7 +784,8 @@ func TestDeviceClassManager_NoFallbackAttribute(t *testing.T) {
 
 	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
-	require.Len(t, classes.Items, 1)
+	// 1 per-instance + 1 aggregate = 2
+	require.Len(t, classes.Items, 2)
 
 	// With the default pcieroot rule (which has fallback), coupling label may
 	// be set to "loose" when devices don't publish pcieroot. The explicit
@@ -790,4 +807,109 @@ func TestDeviceClassManager_NoFallbackAttribute(t *testing.T) {
 		}
 	}
 	assert.True(t, hasNVLink, "should have NVLink alignment without fallback")
+}
+
+func TestFractionToTierName(t *testing.T) {
+	tests := []struct {
+		num, den int
+		want     string
+	}{
+		{1, 8, "eighth"},
+		{1, 4, "quarter"},
+		{2, 8, "quarter"},
+		{1, 2, "half"},
+		{4, 8, "half"},
+		{1, 1, "full"},
+		{8, 8, "full"},
+		{1, 3, "third"},
+		{1, 6, "sixth"},
+		{1, 16, "sixteenth"},
+		{1, 12, "twelfth"},
+		{3, 8, ""},
+		{1, 5, ""},
+		{1, 7, ""},
+		{0, 8, ""},
+		{1, 0, ""},
+	}
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("%d/%d", tt.num, tt.den), func(t *testing.T) {
+			got := fractionToTierName(tt.num, tt.den)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestDeviceClassManager_TierNamedAggregates(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Simulate an 8-PCIe-root, 4-NUMA node (typical HGX-style).
+	// 8 pcieroot partitions, 4 NUMA partitions (2 PCIe roots per NUMA).
+	var partitions []PartitionDevice
+	numaForRoot := []int64{0, 0, 1, 1, 2, 2, 3, 3}
+	for i := 0; i < 8; i++ {
+		partitions = append(partitions, PartitionDevice{
+			Name:         fmt.Sprintf("node-1-pcieroot-%d", i),
+			Type:         PartitionPCIeRoot,
+			Profile:      "hgx-b200",
+			NUMANodes:    []int64{numaForRoot[i]},
+			PCIeRoots:    []string{fmt.Sprintf("pci0000:%02x", i)},
+			DeviceCounts: map[string]int{"gpu.nvidia.com": 1, "rdma.mellanox.com": 1},
+		})
+	}
+	for i := 0; i < 4; i++ {
+		partitions = append(partitions, PartitionDevice{
+			Name:         fmt.Sprintf("node-1-numa-%d", i),
+			Type:         PartitionNUMA,
+			Profile:      "hgx-b200",
+			NUMANodes:    []int64{int64(i)},
+			DeviceCounts: map[string]int{"gpu.nvidia.com": 2, "rdma.mellanox.com": 2},
+		})
+	}
+	partitions = append(partitions, PartitionDevice{
+		Name:         "node-1-full",
+		Type:         PartitionFull,
+		Profile:      "hgx-b200",
+		DeviceCounts: map[string]int{"gpu.nvidia.com": 8, "rdma.mellanox.com": 8},
+	})
+
+	results := []PartitionResult{{
+		NodeName:   "node-1",
+		Profile:    "hgx-b200",
+		Partitions: partitions,
+	}}
+
+	err := manager.SyncDeviceClasses(context.Background(), results)
+	require.NoError(t, err)
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+
+	// Collect DeviceClass names
+	names := make(map[string]bool)
+	for _, dc := range classes.Items {
+		names[dc.Name] = true
+	}
+
+	// Topology-named aggregates
+	assert.True(t, names["pcieroot"], "should have aggregate 'pcieroot' DeviceClass")
+	assert.True(t, names["numa"], "should have aggregate 'numa' DeviceClass")
+	assert.True(t, names["full"], "should have 'full' DeviceClass")
+
+	// Tier-named aggregates
+	assert.True(t, names["eighth"], "pcieroot (1/8) should produce 'eighth' tier alias")
+	assert.True(t, names["quarter"], "numa (2/8=1/4) should produce 'quarter' tier alias")
+
+	// Verify the "eighth" DeviceClass has the tierName label
+	for _, dc := range classes.Items {
+		if dc.Name == "eighth" {
+			assert.Equal(t, "eighth", dc.Labels[CoordinatorDriverName+"/tierName"])
+			assert.Equal(t, "pcieroot", dc.Labels[CoordinatorDriverName+"/partitionType"])
+		}
+		if dc.Name == "quarter" {
+			assert.Equal(t, "quarter", dc.Labels[CoordinatorDriverName+"/tierName"])
+			assert.Equal(t, "numa", dc.Labels[CoordinatorDriverName+"/partitionType"])
+		}
+	}
 }
