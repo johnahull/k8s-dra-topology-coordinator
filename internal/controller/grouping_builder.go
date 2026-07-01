@@ -244,14 +244,15 @@ func (b *GroupingBuilder) groupByAlignment(
 	devices []TopologyDevice,
 	alignment string,
 ) map[string][]TopologyDevice {
-	if alignment == "numaNode" {
-		return groupDevicesByNUMA(devices)
-	}
 	return groupDevicesByAttribute(devices, func(d TopologyDevice) string {
 		switch alignment {
 		case "pcieRoot":
 			if d.PCIeRoot != nil {
 				return *d.PCIeRoot
+			}
+		case "numaNode":
+			if d.NUMANode != nil {
+				return fmt.Sprintf("%d", *d.NUMANode)
 			}
 		case "socket":
 			if d.Socket != nil {

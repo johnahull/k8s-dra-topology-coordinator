@@ -3,7 +3,6 @@ package controller
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -132,9 +131,13 @@ func (b *PartitionBuilder) buildNodePartitions(
 		return ""
 	})
 
-	// Group devices by NUMA node (SLIT-aware: devices with multi-NUMA lists
-	// appear in all equidistant NUMA groups)
-	byNUMA := groupDevicesByNUMA(effectiveDevices)
+	// Group devices by NUMA node
+	byNUMA := groupDevicesByAttribute(effectiveDevices, func(d TopologyDevice) string {
+		if d.NUMANode != nil {
+			return fmt.Sprintf("%d", *d.NUMANode)
+		}
+		return ""
+	})
 
 	// Validate grouping alignment using extended rules
 	for _, rule := range groupingRules {
@@ -195,12 +198,7 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 
 	// Validate that extended grouping rules are satisfied.
 	// Build a new map to avoid mutating validGroups during iteration.
-	// Skip NUMA-mapped rules for NUMA partitions — SLIT-aware grouping
-	// already placed devices correctly; re-splitting would undo it.
 	for _, rule := range groupingRules {
-		if partType == PartitionNUMA && rule.MapsTo == "numaNode" {
-			continue
-		}
 		splitGroups := make(map[string][]TopologyDevice)
 		for key, devices := range validGroups {
 			if !devicesShareAttribute(devices, rule.Attribute) {
@@ -231,14 +229,6 @@ func (b *PartitionBuilder) buildPartitionsFromGroups(
 			fmt.Sprintf("%s-%s-%d", nodeName, partType, i),
 			nodeName, profile, partType, devices,
 		)
-		// For NUMA partitions, override NUMANodes to the group key only.
-		// SLIT-duplicated devices bring their primary NUMA, but the partition
-		// represents a single NUMA node's view of available devices.
-		if partType == PartitionNUMA {
-			if numaID, err := strconv.ParseInt(key, 10, 64); err == nil {
-				p.NUMANodes = []int64{numaID}
-			}
-		}
 		partitions = append(partitions, p)
 	}
 
@@ -298,12 +288,6 @@ func (b *PartitionBuilder) buildPCIeRootPartitions(
 			if numRoots > 0 {
 				numaDevices := byNUMA[parentNUMA]
 				for _, d := range numaDevices {
-					// Skip devices whose primary NUMA is elsewhere — they were
-					// added to this NUMA group via SLIT equidistance but their
-					// capacity belongs to their home NUMA.
-					if d.NUMANode != nil && fmt.Sprintf("%d", *d.NUMANode) != parentNUMA {
-						continue
-					}
 					driver := baseDriverName(d.DriverName)
 					if len(d.Capacity) > 0 && p.DeviceCounts[driver] == 0 {
 						if p.DeviceCapacity == nil {
@@ -442,25 +426,6 @@ func (b *PartitionBuilder) validateGroupingAlignment(devices []TopologyDevice, r
 		}
 	}
 	return true
-}
-
-// groupDevicesByNUMA groups devices by NUMA node, using the full NUMANodes list
-// when available. Devices with a multi-element NUMANodes list (SLIT-aware) appear
-// in all listed NUMA groups. Devices with only a scalar NUMANode appear in one group.
-func groupDevicesByNUMA(devices []TopologyDevice) map[string][]TopologyDevice {
-	groups := make(map[string][]TopologyDevice)
-	for _, d := range devices {
-		if len(d.NUMANodes) > 1 {
-			for _, n := range d.NUMANodes {
-				key := fmt.Sprintf("%d", n)
-				groups[key] = append(groups[key], d)
-			}
-		} else if d.NUMANode != nil {
-			key := fmt.Sprintf("%d", *d.NUMANode)
-			groups[key] = append(groups[key], d)
-		}
-	}
-	return groups
 }
 
 // groupDevicesByAttribute groups devices by a string key derived from each device.
