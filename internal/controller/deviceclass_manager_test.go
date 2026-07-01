@@ -897,19 +897,15 @@ func TestDeviceClassManager_TierNamedAggregates(t *testing.T) {
 	assert.True(t, names["numa"], "should have aggregate 'numa' DeviceClass")
 	assert.True(t, names["full"], "should have 'full' DeviceClass")
 
-	// Tier-named aggregates
+	// Tier-named aggregates (only from pcieroot partitions)
 	assert.True(t, names["eighth"], "pcieroot (1/8) should produce 'eighth' tier alias")
-	assert.True(t, names["quarter"], "numa (2/8=1/4) should produce 'quarter' tier alias")
+	assert.False(t, names["quarter"], "NUMA should NOT produce tier alias — tier names only come from pcieroot")
 
 	// Verify the "eighth" DeviceClass has the tierName label
 	for _, dc := range classes.Items {
 		if dc.Name == "eighth" {
 			assert.Equal(t, "eighth", dc.Labels[CoordinatorDriverName+"/tierName"])
 			assert.Equal(t, "pcieroot", dc.Labels[CoordinatorDriverName+"/partitionType"])
-		}
-		if dc.Name == "quarter" {
-			assert.Equal(t, "quarter", dc.Labels[CoordinatorDriverName+"/tierName"])
-			assert.Equal(t, "numa", dc.Labels[CoordinatorDriverName+"/partitionType"])
 		}
 	}
 }
