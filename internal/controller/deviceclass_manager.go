@@ -152,39 +152,78 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
 	// No NUMA/PCIe selectors — the scheduler picks placement.
-	// Pick the representative with the most drivers so the aggregate
-	// includes all device types (e.g., NICs only exist on some PCIe roots).
-	aggregates := make(map[aggregateKey]*profilePartition)
+	// Merge device counts across all partitions of the same type so the
+	// aggregate includes all device types (e.g., NICs only exist on some
+	// PCIe roots, NVMe on others).
+	type aggregateState struct {
+		profile      string
+		partType     PartitionType
+		mergedCounts map[string]int
+		mergedCap    map[string]map[string]string
+		devices      []TopologyDevice
+		count        int
+	}
+	aggStates := make(map[aggregateKey]*aggregateState)
 	for _, pp := range seen {
 		if pp.partType == PartitionFull {
 			continue
 		}
 		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
-		if existing, ok := aggregates[ak]; ok {
+		if existing, ok := aggStates[ak]; ok {
 			existing.count += pp.count
-			if len(pp.representative.DeviceCounts) > len(existing.representative.DeviceCounts) {
-				aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
-				existing.representative = pp.representative
-				existing.cachedConfig = aggConfig
-				existing.cachedCoupling = aggCoupling
+			for driver, count := range pp.representative.DeviceCounts {
+				if _, has := existing.mergedCounts[driver]; !has {
+					existing.mergedCounts[driver] = count
+					if pp.representative.DeviceCapacity != nil {
+						if cap, ok := pp.representative.DeviceCapacity[driver]; ok {
+							existing.mergedCap[driver] = cap
+						}
+					}
+				}
 			}
+			existing.devices = append(existing.devices, pp.representative.Devices...)
 		} else {
-			aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
-			aggregates[ak] = &profilePartition{
-				profile:        pp.profile,
-				partType:       pp.partType,
-				representative: pp.representative,
-				cachedConfig:   aggConfig,
-				cachedCoupling: aggCoupling,
-				count:          pp.count,
+			merged := make(map[string]int)
+			for k, v := range pp.representative.DeviceCounts {
+				merged[k] = v
+			}
+			mergedCap := make(map[string]map[string]string)
+			if pp.representative.DeviceCapacity != nil {
+				for k, v := range pp.representative.DeviceCapacity {
+					mergedCap[k] = v
+				}
+			}
+			aggStates[ak] = &aggregateState{
+				profile:      pp.profile,
+				partType:     pp.partType,
+				mergedCounts: merged,
+				mergedCap:    mergedCap,
+				devices:      append([]TopologyDevice{}, pp.representative.Devices...),
+				count:        pp.count,
 			}
 		}
 	}
+	aggregates := make(map[aggregateKey]*profilePartition)
+	for ak, state := range aggStates {
+		mergedRep := PartitionDevice{
+			Profile:        state.profile,
+			Type:           state.partType,
+			DeviceCounts:   state.mergedCounts,
+			DeviceCapacity: state.mergedCap,
+			Devices:        state.devices,
+		}
+		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep)
+		aggregates[ak] = &profilePartition{
+			profile:        state.profile,
+			partType:       state.partType,
+			representative: mergedRep,
+			cachedConfig:   aggConfig,
+			cachedCoupling: aggCoupling,
+			count:          state.count,
+		}
+	}
 	for _, pp := range aggregates {
-		aggRep := pp.representative
-		aggRep.NUMANodes = nil
-		aggRep.PCIeRoots = nil
-		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, aggRep, pp.cachedConfig, CouplingNone, pp.count)
+		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, CouplingNone, pp.count)
 		dc.Name = string(pp.partType)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
