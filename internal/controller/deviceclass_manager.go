@@ -152,6 +152,8 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 
 	// Emit aggregate DeviceClasses per partition type (pcieroot, numa).
 	// No NUMA/PCIe selectors — the scheduler picks placement.
+	// Pick the representative with the most drivers so the aggregate
+	// includes all device types (e.g., NICs only exist on some PCIe roots).
 	aggregates := make(map[aggregateKey]*profilePartition)
 	for _, pp := range seen {
 		if pp.partType == PartitionFull {
@@ -160,6 +162,12 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
 		if existing, ok := aggregates[ak]; ok {
 			existing.count += pp.count
+			if len(pp.representative.DeviceCounts) > len(existing.representative.DeviceCounts) {
+				aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
+				existing.representative = pp.representative
+				existing.cachedConfig = aggConfig
+				existing.cachedCoupling = aggCoupling
+			}
 		} else {
 			aggConfig, aggCoupling := m.buildPartitionAggregateConfig(pp.representative)
 			aggregates[ak] = &profilePartition{
