@@ -268,9 +268,34 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 	return patches, nil
 }
 
-// expandRequest expands a single partition DeviceRequest into sub-resource requests
-// and alignment constraints based on the PartitionConfig.
+// expandRequest expands a partition DeviceRequest into sub-resource requests.
+// When req.Exactly.Count > 1, creates N independent partition instances, each
+// with its own set of sub-requests and alignment constraints.
 func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *controller.PartitionConfig) ([]resourcev1.DeviceRequest, []resourcev1.DeviceConstraint) {
+	count := int64(1)
+	if req.Exactly != nil && req.Exactly.Count > 1 {
+		count = req.Exactly.Count
+	}
+
+	var allSubRequests []resourcev1.DeviceRequest
+	var allConstraints []resourcev1.DeviceConstraint
+
+	for i := int64(0); i < count; i++ {
+		prefix := req.Name
+		if count > 1 {
+			prefix = fmt.Sprintf("%s-%d", req.Name, i)
+		}
+		subRequests, constraints := ce.expandSinglePartition(prefix, req, config)
+		allSubRequests = append(allSubRequests, subRequests...)
+		allConstraints = append(allConstraints, constraints...)
+	}
+
+	return allSubRequests, allConstraints
+}
+
+// expandSinglePartition expands one partition instance into sub-resource requests
+// and alignment constraints. The prefix determines the naming of generated requests.
+func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.DeviceRequest, config *controller.PartitionConfig) ([]resourcev1.DeviceRequest, []resourcev1.DeviceConstraint) {
 	var subRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 
@@ -279,7 +304,7 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 
 	for _, sr := range config.SubResources {
 		sanitized := sanitizeDeviceClassName(sr.DeviceClass)
-		name := req.Name + "-" + sanitized
+		name := prefix + "-" + sanitized
 		requestNameMap[sr.DeviceClass] = name
 
 		count := int64(sr.Count)
@@ -354,7 +379,7 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 				for _, sr := range config.SubResources {
 					sanitized := sanitizeDeviceClassName(sr.DeviceClass)
 					if reqName == sanitized {
-						resolvedRequests = append(resolvedRequests, req.Name+"-"+sanitized)
+						resolvedRequests = append(resolvedRequests, prefix+"-"+sanitized)
 						found = true
 						break
 					}

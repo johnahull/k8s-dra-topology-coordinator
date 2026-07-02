@@ -691,7 +691,7 @@ func makeTopologyResourceSlice(name, driver, nodeName, poolName string, numaNode
 		devices = append(devices, resourcev1.Device{
 			Name: fmt.Sprintf("dev-%d", i),
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				resourcev1.QualifiedName(controller.AttrNUMANode):                {IntValue: &numaNode},
+				resourcev1.QualifiedName(controller.AttrNUMANode):           {IntValue: &numaNode},
 				resourcev1.QualifiedName("resource.kubernetes.io/pcieRoot"): {StringValue: &pcieRoot},
 			},
 		})
@@ -710,6 +710,124 @@ func makeTopologyResourceSlice(name, driver, nodeName, poolName string, numaNode
 			Devices: devices,
 		},
 	}
+}
+
+func TestExpandClaimCountGreaterThanOne(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.amd.com", Count: 1},
+			{DeviceClass: "dra.cpu", Count: 1},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("eighth", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+	expander := NewClaimExpander(client)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+		},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partitions",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "eighth",
+							Count:           3,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	var requestsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/requests" {
+			requestsPatch = &patches[i]
+		}
+	}
+	require.NotNil(t, requestsPatch)
+
+	reqBytes, _ := json.Marshal(requestsPatch.Value)
+	var reqs []resourcev1.DeviceRequest
+	require.NoError(t, json.Unmarshal(reqBytes, &reqs))
+
+	// 3 instances × 2 sub-resources = 6 requests
+	assert.Len(t, reqs, 6, "count=3 with 2 sub-resources should produce 6 requests")
+
+	// Verify indexed naming
+	expectedNames := []string{
+		"partitions-0-gpu-amd-com", "partitions-0-dra-cpu",
+		"partitions-1-gpu-amd-com", "partitions-1-dra-cpu",
+		"partitions-2-gpu-amd-com", "partitions-2-dra-cpu",
+	}
+	actualNames := make([]string, len(reqs))
+	for i, r := range reqs {
+		actualNames[i] = r.Name
+	}
+	assert.ElementsMatch(t, expectedNames, actualNames)
+}
+
+func TestExpandClaimCountOneUnchanged(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.amd.com", Count: 1},
+		},
+	}
+
+	partClass := makePartitionDeviceClass("eighth", partConfig)
+	client := fake.NewSimpleClientset(partClass)
+	expander := NewClaimExpander(client)
+
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-claim",
+			Namespace: "default",
+		},
+		Spec: resourcev1.ResourceClaimSpec{
+			Devices: resourcev1.DeviceClaim{
+				Requests: []resourcev1.DeviceRequest{
+					{
+						Name: "partition",
+						Exactly: &resourcev1.ExactDeviceRequest{
+							DeviceClassName: "eighth",
+							Count:           1,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	patches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+	require.NotEmpty(t, patches)
+
+	var requestsPatch *jsonPatch
+	for i := range patches {
+		if patches[i].Path == "/spec/devices/requests" {
+			requestsPatch = &patches[i]
+		}
+	}
+	require.NotNil(t, requestsPatch)
+
+	reqBytes, _ := json.Marshal(requestsPatch.Value)
+	var reqs []resourcev1.DeviceRequest
+	require.NoError(t, json.Unmarshal(reqBytes, &reqs))
+
+	// count=1 should NOT add index to name
+	assert.Len(t, reqs, 1)
+	assert.Equal(t, "partition-gpu-amd-com", reqs[0].Name)
 }
 
 func TestSanitizeDeviceClassName(t *testing.T) {
