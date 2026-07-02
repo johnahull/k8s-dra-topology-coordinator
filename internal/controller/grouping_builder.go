@@ -38,6 +38,11 @@ type GroupingInstance struct {
 
 	// ExtendedAttributes from topology rules.
 	ExtendedAttributes map[string]DeviceAttributeValue
+
+	// RailIndex is the deterministic index of this instance within its
+	// grouping on a node. Used for rail networking to map GPU-to-NIC
+	// pairings consistently across nodes.
+	RailIndex int
 }
 
 // GroupingResult holds all computed grouping instances for a single node.
@@ -231,6 +236,7 @@ func (b *GroupingBuilder) findInstances(
 				fmt.Sprintf("%s-%s-%s-%d", nodeName, grouping.Name, sanitizeForName(alignment), idx),
 				nodeName, grouping, alignment, instanceDevices,
 			)
+			inst.RailIndex = idx
 			instances = append(instances, inst)
 			idx++
 		}

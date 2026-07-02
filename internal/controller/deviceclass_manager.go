@@ -1096,6 +1096,7 @@ func (m *DeviceClassManager) buildGroupingDeviceClass(
 		CoordinatorDriverName + "/managed":   "true",
 		CoordinatorDriverName + "/grouping":  truncateLabel(representative.GroupingName),
 		CoordinatorDriverName + "/alignment": representative.Alignment,
+		CoordinatorDriverName + "/railIndex": fmt.Sprintf("%d", representative.RailIndex),
 	}
 	if len(representative.NUMANodes) > 0 {
 		labels[CoordinatorDriverName+"/numa"] = numaKey(representative.NUMANodes)

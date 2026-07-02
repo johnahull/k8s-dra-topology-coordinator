@@ -90,6 +90,79 @@ func (b *PartitionBuilder) BuildPartitions() []PartitionResult {
 	return results
 }
 
+// DetectPCIeRootPairings auto-discovers device pairings by finding PCIe roots
+// that host devices from 2+ different drivers. Each unique driver combination
+// produces a DeviceGrouping with pcieRoot alignment and numaNode fallback.
+// Capacity-only drivers (CPU, memory) are excluded.
+func (b *PartitionBuilder) DetectPCIeRootPairings() []DeviceGrouping {
+	nodes := b.model.GetNodeTopologies()
+
+	type driverPair struct{ a, b string }
+	seen := make(map[driverPair]bool)
+	var groupings []DeviceGrouping
+
+	for _, nodeTopo := range nodes {
+		allDevices := nodeTopo.AllDevices()
+
+		byPCIeRoot := groupDevicesByAttribute(allDevices, func(d TopologyDevice) string {
+			if d.PCIeRoot != nil {
+				return *d.PCIeRoot
+			}
+			return ""
+		})
+
+		for rootKey, devices := range byPCIeRoot {
+			if rootKey == "" {
+				continue
+			}
+
+			// Collect unique PCI drivers on this root (exclude capacity-only)
+			pciDrivers := make(map[string]int)
+			for _, d := range devices {
+				driver := baseDriverName(d.DriverName)
+				if len(d.Capacity) > 0 && d.PCIeRoot == nil {
+					continue
+				}
+				pciDrivers[driver]++
+			}
+
+			if len(pciDrivers) < 2 {
+				continue
+			}
+
+			// Create pairings for each unique driver combination
+			drivers := make([]string, 0, len(pciDrivers))
+			for d := range pciDrivers {
+				drivers = append(drivers, d)
+			}
+			sort.Strings(drivers)
+
+			for i := 0; i < len(drivers); i++ {
+				for j := i + 1; j < len(drivers); j++ {
+					pair := driverPair{drivers[i], drivers[j]}
+					if seen[pair] {
+						continue
+					}
+					seen[pair] = true
+
+					name := "gpu-nic-pair"
+					groupings = append(groupings, DeviceGrouping{
+						Name:      name,
+						Alignment: "pcieRoot",
+						Fallback:  "numaNode",
+						Devices: []GroupingDevice{
+							{Class: b.rules.GetDeviceClassForDriver(drivers[i]), Count: 1},
+							{Class: b.rules.GetDeviceClassForDriver(drivers[j]), Count: 1},
+						},
+					})
+				}
+			}
+		}
+	}
+
+	return groupings
+}
+
 // buildNodePartitions computes partitions for a single node.
 func (b *PartitionBuilder) buildNodePartitions(
 	nodeName string,

@@ -247,15 +247,23 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		partitionCount = countDeviceClasses(results)
 	}
 
-	if !skipGroupings && len(groupings) > 0 {
-		groupingResults := c.groupingBuilder.BuildGroupings(groupings)
+	if !skipGroupings {
+		// Auto-detect PCIe root pairings (GPU+NIC, GPU+NVMe, etc.)
+		autoGroupings := c.partitionBuilder.DetectPCIeRootPairings()
 
-		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
-			metrics.ReconciliationErrors.Inc()
-			return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
+		// Merge: ConfigMap-defined groupings override auto-detected ones with the same name
+		mergedGroupings := mergeGroupings(autoGroupings, groupings)
+
+		if len(mergedGroupings) > 0 {
+			groupingResults := c.groupingBuilder.BuildGroupings(mergedGroupings)
+
+			if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
+				metrics.ReconciliationErrors.Inc()
+				return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
+			}
+
+			groupingCount = countGroupingDeviceClasses(groupingResults)
 		}
-
-		groupingCount = countGroupingDeviceClasses(groupingResults)
 	}
 
 	metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
@@ -417,6 +425,24 @@ func (c *Controller) onGroupingConfigMapDelete(obj interface{}) {
 	}
 	c.groupingStore.RemoveConfigMap(cm.Namespace, cm.Name)
 	c.workqueue.AddAfter("reconcile", reconcileDebounceDelay)
+}
+
+// mergeGroupings combines auto-detected and user-defined groupings.
+// User-defined groupings (from ConfigMaps) override auto-detected ones
+// with the same name.
+func mergeGroupings(autoDetected, userDefined []DeviceGrouping) []DeviceGrouping {
+	byName := make(map[string]DeviceGrouping)
+	for _, g := range autoDetected {
+		byName[g.Name] = g
+	}
+	for _, g := range userDefined {
+		byName[g.Name] = g
+	}
+	merged := make([]DeviceGrouping, 0, len(byName))
+	for _, g := range byName {
+		merged = append(merged, g)
+	}
+	return merged
 }
 
 func countGroupingDeviceClasses(results []GroupingResult) int {
