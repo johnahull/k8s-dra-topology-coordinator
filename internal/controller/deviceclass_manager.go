@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	resourcev1 "k8s.io/api/resource/v1"
@@ -139,11 +140,38 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		}
 	}
 
+	// Compute rail indices for pcieroot partitions based on sorted PCIe root
+	// address. Uses the first PCIeRoot from each partition's representative,
+	// matching the sort order used by the grouping builder for gpu-nic-pair.
+	type pcieRootEntry struct {
+		key      string
+		pcieRoot string
+	}
+	var pcieRootEntries []pcieRootEntry
+	for key, pp := range seen {
+		if pp.partType == PartitionPCIeRoot && len(pp.representative.PCIeRoots) > 0 {
+			pcieRootEntries = append(pcieRootEntries, pcieRootEntry{key: key, pcieRoot: pp.representative.PCIeRoots[0]})
+		}
+	}
+	sort.Slice(pcieRootEntries, func(i, j int) bool {
+		return pcieRootEntries[i].pcieRoot < pcieRootEntries[j].pcieRoot
+	})
+	pcieRootRailIndex := make(map[string]int)
+	for i, entry := range pcieRootEntries {
+		pcieRootRailIndex[entry.key] = i
+	}
+
 	// Create/update a DeviceClass for each profile+partitionType
-	for _, pp := range seen {
+	for key, pp := range seen {
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, pp.cachedCoupling, pp.count)
 		if pp.partType == PartitionFull {
 			dc.Name = string(PartitionFull)
+		}
+		if pp.partType == PartitionPCIeRoot {
+			if rail, ok := pcieRootRailIndex[key]; ok {
+				dc.Labels[CoordinatorDriverName+"/railIndex"] = fmt.Sprintf("%d", rail)
+				dc.Name = fmt.Sprintf("%s-rail%d", dc.Name, rail)
+			}
 		}
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
@@ -930,9 +958,10 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		}
 	}
 
-	// Emit per-instance DeviceClasses (NUMA-specific)
+	// Emit per-instance DeviceClasses with rail index in name
 	for key, entry := range seen {
 		dc := m.buildGroupingDeviceClass(key, entry.representative, entry.config, entry.count)
+		dc.Name = fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
 		}
