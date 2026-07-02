@@ -465,6 +465,23 @@ func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribut
 
 // deviceAttributeValueString returns the string representation of the device's
 // value for the given attribute, checking standard attributes and extended attributes.
+// deviceHasScalarAttribute returns true if a device publishes the given
+// attribute as a scalar value (not list-only). Used for matchAttribute
+// constraints which require scalar equality in the scheduler.
+func deviceHasScalarAttribute(dev TopologyDevice, attribute string) bool {
+	switch attribute {
+	case AttrNUMANode:
+		return dev.NUMANode != nil
+	case AttrPCIeRoot:
+		return dev.PCIeRoot != nil
+	case AttrSocket:
+		return dev.Socket != nil
+	default:
+		_, ok := dev.ExtendedAttributes[attribute]
+		return ok
+	}
+}
+
 func deviceAttributeValueString(dev TopologyDevice, attribute string) string {
 	vals := deviceAttributeValues(dev, attribute)
 	if len(vals) > 0 {

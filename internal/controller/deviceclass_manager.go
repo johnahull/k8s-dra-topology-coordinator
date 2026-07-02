@@ -649,20 +649,20 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		}
 
 		// Build request names for this constraint: only include drivers whose
-		// devices actually publish the attribute. CPU and memory don't publish
-		// pcieRoot, so including them in a pcieRoot matchAttribute makes the
-		// constraint unsatisfiable.
+		// devices publish the attribute as a scalar value. Drivers that only
+		// publish list-type attributes (e.g., CPU's pcieRoot list) are excluded
+		// because the scheduler's matchAttribute uses scalar equality, not list
+		// membership. List-type attributes are handled by CEL includes() selectors.
 		var constraintRequests []string
 		if len(representative.Devices) > 0 {
-			driversWithAttribute := make(map[string]bool)
+			driversWithScalarAttribute := make(map[string]bool)
 			for _, dev := range representative.Devices {
-				val := deviceAttributeValueString(dev, rule.Attribute)
-				if val != "" {
-					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				if deviceHasScalarAttribute(dev, rule.Attribute) {
+					driversWithScalarAttribute[baseDriverName(dev.DriverName)] = true
 				}
 			}
 			for driver := range representative.DeviceCounts {
-				if driversWithAttribute[baseDriverName(driver)] {
+				if driversWithScalarAttribute[baseDriverName(driver)] {
 					constraintRequests = append(constraintRequests, driver)
 				}
 			}
@@ -745,15 +745,14 @@ func (m *DeviceClassManager) buildPartitionAggregateConfig(representative Partit
 
 		var constraintRequests []string
 		if len(representative.Devices) > 0 {
-			driversWithAttribute := make(map[string]bool)
+			driversWithScalarAttribute := make(map[string]bool)
 			for _, dev := range representative.Devices {
-				val := deviceAttributeValueString(dev, rule.Attribute)
-				if val != "" {
-					driversWithAttribute[baseDriverName(dev.DriverName)] = true
+				if deviceHasScalarAttribute(dev, rule.Attribute) {
+					driversWithScalarAttribute[baseDriverName(dev.DriverName)] = true
 				}
 			}
 			for driver := range representative.DeviceCounts {
-				if driversWithAttribute[baseDriverName(driver)] && !reachableOnly[driver] {
+				if driversWithScalarAttribute[baseDriverName(driver)] && !reachableOnly[driver] {
 					constraintRequests = append(constraintRequests, driver)
 				}
 			}
