@@ -145,7 +145,10 @@ func (b *PartitionBuilder) DetectPCIeRootPairings() []DeviceGrouping {
 					}
 					seen[pair] = true
 
-					name := "gpu-nic-pair"
+					classA := b.rules.GetDeviceClassForDriver(drivers[i])
+					classB := b.rules.GetDeviceClassForDriver(drivers[j])
+					name := sanitizeDNSLabel(
+						sanitizeForName(classA) + "-" + sanitizeForName(classB) + "-pair")
 					groupings = append(groupings, DeviceGrouping{
 						Name:      name,
 						Alignment: "pcieRoot",
