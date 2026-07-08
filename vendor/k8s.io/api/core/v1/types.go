@@ -4965,11 +4965,8 @@ type PodSecurityContext struct {
 	// Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
 	// whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
 	// CSIDriver instance. Other volumes are always re-labelled recursively.
-	// "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 	//
-	// If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-	// If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-	// and "Recursive" for all other volumes.
+	// If not specified, "MountOption" is used.
 	//
 	// This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 	//
@@ -6551,6 +6548,9 @@ type NodeSpec struct {
 
 	// ID of the node assigned by the cloud provider in the format: <ProviderName>://<ProviderSpecificNodeID>
 	// +optional
+	// +k8s:alpha(since: "1.36")=+k8s:optional
+	// +k8s:alpha(since: "1.36")=+k8s:update=NoModify
+	// +k8s:alpha(since: "1.36")=+k8s:update=NoUnset
 	ProviderID string `json:"providerID,omitempty" protobuf:"bytes,3,opt,name=providerID"`
 	// Unschedulable controls node schedulability of new pods. By default, node is schedulable.
 	// More info: https://kubernetes.io/docs/concepts/nodes/node/#manual-node-administration

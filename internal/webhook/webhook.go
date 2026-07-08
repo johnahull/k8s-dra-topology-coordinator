@@ -585,8 +585,9 @@ func (ce *ClaimExpander) handlePodAdmission(ctx context.Context, req *admissionv
 	}
 }
 
-// handleVMIAdmission rewrites GPU and HostDevice requestName fields in a
-// KubeVirt VirtualMachineInstance to match expanded partition request names.
+// handleVMIAdmission auto-generates hostDevices for KubeVirt VMIs that
+// reference partition ResourceClaimTemplates, and rewrites requestName fields
+// on any existing hostDevices/gpus to match expanded partition request names.
 func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
 	var vmi map[string]interface{}
 	if err := json.Unmarshal(req.Object.Raw, &vmi); err != nil {
@@ -594,10 +595,131 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 		return allowResponse()
 	}
 
-	// Build expansion map from referenced claims
-	expansionMap := make(map[string]map[string][]string) // claim name -> original request -> expanded requests
+	var patches []jsonPatch
 
 	resourceClaims, _ := nestedSlice(vmi, "spec", "resourceClaims")
+	existingHostDevices, _ := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+
+	// For each resourceClaim referencing a template, look up the template's
+	// DeviceClass config and auto-generate hostDevices if none exist for it.
+	for _, rc := range resourceClaims {
+		rcMap, ok := rc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rcName, _ := rcMap["name"].(string)
+		templateName, _ := rcMap["resourceClaimTemplateName"].(string)
+		if templateName == "" {
+			continue
+		}
+
+		// Check if the VMI already has hostDevices for this claim
+		hasDevices := false
+		for _, hd := range existingHostDevices {
+			hdMap, _ := hd.(map[string]interface{})
+			if hdMap["claimName"] == rcName {
+				hasDevices = true
+				break
+			}
+		}
+		if hasDevices {
+			continue
+		}
+
+		// Look up the ResourceClaimTemplate
+		tpl, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Get(ctx, templateName, metav1.GetOptions{})
+		if err != nil {
+			klog.Warningf("VMI webhook: failed to get ResourceClaimTemplate %s: %v", templateName, err)
+			continue
+		}
+		// Find the partition request and its DeviceClass
+		for _, tplReq := range tpl.Spec.Spec.Devices.Requests {
+			if tplReq.Exactly == nil || tplReq.Exactly.DeviceClassName == "" {
+				continue
+			}
+
+			config, err := ce.getPartitionConfig(ctx, tplReq.Exactly.DeviceClassName)
+			if err != nil || config == nil {
+				continue
+			}
+
+			count := int64(1)
+			if tplReq.Exactly.Count > 1 {
+				count = tplReq.Exactly.Count
+			}
+
+			// Identify passthrough device classes (GPU, NIC — not CPU/memory)
+			var passthroughDevices []struct {
+				class    string
+				nameHint string
+			}
+			for _, sr := range config.SubResources {
+				lc := strings.ToLower(sr.DeviceClass)
+				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") || strings.Contains(lc, "amd") {
+					passthroughDevices = append(passthroughDevices, struct {
+						class    string
+						nameHint string
+					}{sr.DeviceClass, "gpu"})
+				} else if strings.Contains(lc, "net") || strings.Contains(lc, "sriov") || strings.Contains(lc, "rdma") {
+					passthroughDevices = append(passthroughDevices, struct {
+						class    string
+						nameHint string
+					}{sr.DeviceClass, "nic"})
+				}
+			}
+
+			if len(passthroughDevices) == 0 {
+				continue
+			}
+
+			// Generate hostDevices for each partition instance
+			hdIdx := len(existingHostDevices)
+			for i := int64(0); i < count; i++ {
+				for _, pd := range passthroughDevices {
+					// Build the expanded request name
+					var requestName string
+					sanitized := sanitizeForRequestName(pd.class)
+					if count > 1 {
+						requestName = fmt.Sprintf("%s-%d-%s", tplReq.Name, i, sanitized)
+					} else {
+						requestName = fmt.Sprintf("%s-%s", tplReq.Name, sanitized)
+					}
+
+					deviceName := fmt.Sprintf("%s%d", pd.nameHint, i*int64(len(passthroughDevices))+int64(indexOf(pd, passthroughDevices)))
+
+					hostDevice := map[string]interface{}{
+						"name":        deviceName,
+						"claimName":   rcName,
+						"requestName": requestName,
+					}
+
+					if hdIdx == 0 && len(existingHostDevices) == 0 {
+						patches = append(patches, jsonPatch{
+							Op:    "add",
+							Path:  "/spec/domain/devices/hostDevices",
+							Value: []interface{}{hostDevice},
+						})
+						hdIdx++
+					} else {
+						patches = append(patches, jsonPatch{
+							Op:    "add",
+							Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/-"),
+							Value: hostDevice,
+						})
+						hdIdx++
+					}
+				}
+			}
+
+			vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
+			klog.Infof("Auto-generated %d hostDevices for VMI %s/%s from template %s (count=%d)",
+				int(count)*len(passthroughDevices), req.Namespace, vmiName, templateName, count)
+		}
+	}
+
+	// Also handle existing hostDevices/gpus that need requestName rewriting
+	// (for manually specified devices referencing pre-expansion names)
+	expansionMap := make(map[string]map[string][]string)
 	for _, rc := range resourceClaims {
 		rcMap, ok := rc.(map[string]interface{})
 		if !ok {
@@ -607,127 +729,93 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 		if claimName == "" {
 			continue
 		}
-
 		claim, err := ce.client.ResourceV1().ResourceClaims(req.Namespace).Get(ctx, claimName, metav1.GetOptions{})
 		if err != nil {
 			continue
 		}
-
 		annotation := claim.Annotations[driverName+"/expanded-requests"]
 		if annotation == "" {
 			continue
 		}
-
 		var mapping map[string][]string
 		if err := json.Unmarshal([]byte(annotation), &mapping); err != nil {
 			continue
 		}
-
 		rcName, _ := rcMap["name"].(string)
 		expansionMap[rcName] = mapping
 	}
 
-	if len(expansionMap) == 0 {
-		return allowResponse()
-	}
-
-	var patches []jsonPatch
-
-	// Rewrite gpus[].requestName
-	gpus, _ := nestedSlice(vmi, "spec", "domain", "devices", "gpus")
-	for i, g := range gpus {
-		gMap, ok := g.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		claimName, _ := gMap["claimName"].(string)
-		requestName, _ := gMap["requestName"].(string)
-		if claimName == "" || requestName == "" {
-			continue
-		}
-		mapping, ok := expansionMap[claimName]
-		if !ok {
-			continue
-		}
-		expanded, ok := mapping[requestName]
-		if !ok || len(expanded) == 0 {
-			continue
-		}
-		// Find the GPU sub-request (contains "gpu" in the name)
-		for _, name := range expanded {
-			if strings.Contains(name, "gpu") {
-				patches = append(patches, jsonPatch{
-					Op:    "replace",
-					Path:  fmt.Sprintf("/spec/domain/devices/gpus/%d/requestName", i),
-					Value: name,
-				})
-				break
+	if len(expansionMap) > 0 {
+		gpus, _ := nestedSlice(vmi, "spec", "domain", "devices", "gpus")
+		for i, g := range gpus {
+			gMap, ok := g.(map[string]interface{})
+			if !ok {
+				continue
 			}
-		}
-	}
-
-	// Rewrite hostDevices[].requestName
-	hostDevices, _ := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
-	for i, hd := range hostDevices {
-		hdMap, ok := hd.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		claimName, _ := hdMap["claimName"].(string)
-		requestName, _ := hdMap["requestName"].(string)
-		if claimName == "" || requestName == "" {
-			continue
-		}
-		mapping, ok := expansionMap[claimName]
-		if !ok {
-			continue
-		}
-		expanded, ok := mapping[requestName]
-		if !ok || len(expanded) == 0 {
-			continue
-		}
-		// For hostDevices, use the device name hint to match
-		deviceName, _ := hdMap["name"].(string)
-		matched := false
-		for _, name := range expanded {
-			if strings.Contains(name, "nvme") && strings.Contains(deviceName, "nvme") {
-				patches = append(patches, jsonPatch{
-					Op:    "replace",
-					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
-					Value: name,
-				})
-				matched = true
-				break
+			claimName, _ := gMap["claimName"].(string)
+			requestName, _ := gMap["requestName"].(string)
+			if claimName == "" || requestName == "" {
+				continue
 			}
-			if strings.Contains(name, "net") && strings.Contains(deviceName, "nic") {
-				patches = append(patches, jsonPatch{
-					Op:    "replace",
-					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
-					Value: name,
-				})
-				matched = true
-				break
+			mapping, ok := expansionMap[claimName]
+			if !ok {
+				continue
 			}
-			if strings.Contains(name, "sriov") && strings.Contains(deviceName, "nic") {
-				patches = append(patches, jsonPatch{
-					Op:    "replace",
-					Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
-					Value: name,
-				})
-				matched = true
-				break
+			expanded, ok := mapping[requestName]
+			if !ok || len(expanded) == 0 {
+				continue
 			}
-		}
-		if !matched {
-			// Fallback: use first non-GPU expanded name
 			for _, name := range expanded {
-				if !strings.Contains(name, "gpu") {
+				if strings.Contains(name, "gpu") {
 					patches = append(patches, jsonPatch{
 						Op:    "replace",
-						Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i),
+						Path:  fmt.Sprintf("/spec/domain/devices/gpus/%d/requestName", i),
 						Value: name,
 					})
 					break
+				}
+			}
+		}
+
+		hostDevices, _ := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+		for i, hd := range hostDevices {
+			hdMap, ok := hd.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			claimName, _ := hdMap["claimName"].(string)
+			requestName, _ := hdMap["requestName"].(string)
+			if claimName == "" || requestName == "" {
+				continue
+			}
+			mapping, ok := expansionMap[claimName]
+			if !ok {
+				continue
+			}
+			expanded, ok := mapping[requestName]
+			if !ok || len(expanded) == 0 {
+				continue
+			}
+			deviceName, _ := hdMap["name"].(string)
+			matched := false
+			for _, name := range expanded {
+				if (strings.Contains(name, "net") || strings.Contains(name, "sriov")) && strings.Contains(deviceName, "nic") {
+					patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+					matched = true
+					break
+				}
+				if strings.Contains(name, "nvme") && strings.Contains(deviceName, "nvme") {
+					patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				for _, name := range expanded {
+					if !strings.Contains(name, "gpu") {
+						patches = append(patches, jsonPatch{Op: "replace", Path: fmt.Sprintf("/spec/domain/devices/hostDevices/%d/requestName", i), Value: name})
+						break
+					}
 				}
 			}
 		}
@@ -738,7 +826,7 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 	}
 
 	vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
-	klog.Infof("Rewriting %d device request names in VMI %s/%s", len(patches), req.Namespace, vmiName)
+	klog.Infof("Patching %d fields in VMI %s/%s", len(patches), req.Namespace, vmiName)
 
 	patchBytes, err := json.Marshal(patches)
 	if err != nil {
@@ -752,6 +840,22 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 		PatchType: &patchType,
 		Patch:     patchBytes,
 	}
+}
+
+func indexOf(target struct{ class, nameHint string }, list []struct{ class, nameHint string }) int {
+	for i, item := range list {
+		if item.class == target.class && item.nameHint == target.nameHint {
+			return i
+		}
+	}
+	return 0
+}
+
+func sanitizeForRequestName(s string) string {
+	return strings.NewReplacer(
+		"/", "-",
+		".", "-",
+	).Replace(strings.ToLower(s))
 }
 
 // nestedSlice extracts a nested []interface{} from a map hierarchy.

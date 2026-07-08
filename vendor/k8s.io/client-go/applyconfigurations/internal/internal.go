@@ -14836,9 +14836,9 @@ var schemaYAML = typed.YAMLObject(`types:
         namedType: io.k8s.api.scheduling.v1alpha3.DisruptionMode
       default:
         single: {}
-    - name: podGroupTemplateRef
+    - name: preemptionPolicy
       type:
-        namedType: io.k8s.api.scheduling.v1alpha3.PodGroupTemplateReference
+        scalar: string
     - name: priority
       type:
         scalar: numeric
@@ -14860,6 +14860,9 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.api.scheduling.v1alpha3.PodGroupSchedulingPolicy
       default: {}
+    - name: workloadRef
+      type:
+        namedType: io.k8s.api.scheduling.v1alpha3.WorkloadReference
 - name: io.k8s.api.scheduling.v1alpha3.PodGroupStatus
   map:
     fields:
@@ -14910,16 +14913,6 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.api.scheduling.v1alpha3.PodGroupSchedulingPolicy
       default: {}
-- name: io.k8s.api.scheduling.v1alpha3.PodGroupTemplateReference
-  map:
-    fields:
-    - name: workload
-      type:
-        namedType: io.k8s.api.scheduling.v1alpha3.WorkloadPodGroupTemplateReference
-    unions:
-    - fields:
-      - fieldName: workload
-        discriminatorValue: Workload
 - name: io.k8s.api.scheduling.v1alpha3.SingleDisruptionMode
   map:
     elementType:
@@ -14970,10 +14963,10 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.api.scheduling.v1alpha3.WorkloadSpec
       default: {}
-- name: io.k8s.api.scheduling.v1alpha3.WorkloadPodGroupTemplateReference
+- name: io.k8s.api.scheduling.v1alpha3.WorkloadReference
   map:
     fields:
-    - name: podGroupTemplateName
+    - name: templateName
       type:
         scalar: string
       default: ""

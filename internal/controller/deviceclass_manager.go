@@ -771,17 +771,39 @@ func (m *DeviceClassManager) buildPartitionAggregateConfig(representative Partit
 			}
 		}
 
+		// For aggregate DeviceClasses, include all drivers that publish the
+		// constraint attribute in any form (scalar or list). List-type attributes
+		// work with matchAttribute constraints via intersection — e.g., a NIC VF
+		// with numaNode=[0,1,2,3] will match any device on NUMA 0, 1, 2, or 3.
+		// Try the primary attribute first; fall back if not enough drivers match.
+		constraintAttr := rule.Attribute
 		var constraintRequests []string
 		if len(representative.Devices) > 0 {
-			driversWithScalarAttribute := make(map[string]bool)
+			driversWithAttribute := make(map[string]bool)
 			for _, dev := range representative.Devices {
-				if deviceHasScalarAttribute(dev, rule.Attribute) {
-					driversWithScalarAttribute[baseDriverName(dev.DriverName)] = true
+				if deviceHasAttribute(dev, constraintAttr) {
+					driversWithAttribute[baseDriverName(dev.DriverName)] = true
 				}
 			}
 			for driver := range representative.DeviceCounts {
-				if driversWithScalarAttribute[baseDriverName(driver)] && !reachableOnly[driver] {
+				if driversWithAttribute[baseDriverName(driver)] {
 					constraintRequests = append(constraintRequests, driver)
+				}
+			}
+			// Fall back to the fallback attribute if primary doesn't cover enough drivers
+			if len(constraintRequests) < 2 && rule.FallbackAttribute != "" {
+				constraintAttr = rule.FallbackAttribute
+				driversWithAttribute = make(map[string]bool)
+				for _, dev := range representative.Devices {
+					if deviceHasAttribute(dev, constraintAttr) {
+						driversWithAttribute[baseDriverName(dev.DriverName)] = true
+					}
+				}
+				constraintRequests = nil
+				for driver := range representative.DeviceCounts {
+					if driversWithAttribute[baseDriverName(driver)] {
+						constraintRequests = append(constraintRequests, driver)
+					}
 				}
 			}
 			if len(constraintRequests) == 0 {
@@ -799,11 +821,49 @@ func (m *DeviceClassManager) buildPartitionAggregateConfig(representative Partit
 		}
 
 		config.Alignments = append(config.Alignments, AlignmentConfig{
-			Attribute:   rule.Attribute,
+			Attribute:   constraintAttr,
 			Requests:    constraintRequests,
 			Enforcement: enforcement,
 		})
 		coupling = CouplingTight
+
+		// If the primary constraint didn't cover all drivers and a fallback
+		// attribute exists, add a second alignment on the fallback attribute
+		// covering all drivers. This ensures devices like memory (which lack
+		// pcieRoot but have numaNode) are co-located with the rest.
+		if rule.FallbackAttribute != "" && constraintAttr != rule.FallbackAttribute {
+			coveredDrivers := make(map[string]bool)
+			for _, r := range constraintRequests {
+				coveredDrivers[r] = true
+			}
+			uncoveredCount := 0
+			for driver := range representative.DeviceCounts {
+				if !coveredDrivers[driver] {
+					uncoveredCount++
+				}
+			}
+			if uncoveredCount > 0 {
+				fallbackDrivers := make(map[string]bool)
+				for _, dev := range representative.Devices {
+					if deviceHasAttribute(dev, rule.FallbackAttribute) {
+						fallbackDrivers[baseDriverName(dev.DriverName)] = true
+					}
+				}
+				var fallbackRequests []string
+				for driver := range representative.DeviceCounts {
+					if fallbackDrivers[baseDriverName(driver)] {
+						fallbackRequests = append(fallbackRequests, driver)
+					}
+				}
+				if len(fallbackRequests) > len(constraintRequests) {
+					config.Alignments = append(config.Alignments, AlignmentConfig{
+						Attribute:   rule.FallbackAttribute,
+						Requests:    fallbackRequests,
+						Enforcement: enforcement,
+					})
+				}
+			}
+		}
 	}
 
 	return config, coupling

@@ -468,6 +468,24 @@ func (m *TopologyModel) isConstraintSatisfiableOnNode(nt *NodeTopology, attribut
 // deviceHasScalarAttribute returns true if a device publishes the given
 // attribute as a scalar value (not list-only). Used for matchAttribute
 // constraints which require scalar equality in the scheduler.
+// deviceHasAttribute returns true if the device publishes the given attribute
+// in any form (scalar or list). Used by aggregate alignment to include drivers
+// that publish list-type attributes (e.g., numaNode as ints) since matchAttribute
+// constraints work via intersection on lists.
+func deviceHasAttribute(dev TopologyDevice, attribute string) bool {
+	switch attribute {
+	case AttrNUMANode:
+		return dev.NUMANode != nil || len(dev.NUMANodes) > 0
+	case AttrPCIeRoot:
+		return dev.PCIeRoot != nil || len(dev.PCIeRoots) > 0
+	case AttrSocket:
+		return dev.Socket != nil
+	default:
+		_, ok := dev.ExtendedAttributes[attribute]
+		return ok
+	}
+}
+
 func deviceHasScalarAttribute(dev TopologyDevice, attribute string) bool {
 	switch attribute {
 	case AttrNUMANode:
