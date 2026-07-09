@@ -1001,8 +1001,11 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 			config := m.buildGroupingConfig(inst)
 
 			nk := numaKey(inst.NUMANodes)
+			pk := strings.Join(inst.PCIeRoots, "-")
 			key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
-			if nk != "" {
+			if pk != "" {
+				key += "-" + sanitizeForName(pk)
+			} else if nk != "" {
 				key += "-numa" + nk
 			}
 
@@ -1054,15 +1057,16 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		}
 	}
 
-	activeKeys := make(map[string]bool, len(seen))
-	for key := range seen {
-		activeKeys[key] = true
+	activeNames := make(map[string]bool, len(seen)+len(aggregates))
+	for _, entry := range seen {
+		name := fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
+		activeNames[name] = true
 	}
 	for _, entry := range aggregates {
-		aggKey := truncateLabel(entry.representative.GroupingName) + "-" + sanitizeForName(entry.representative.Alignment)
-		activeKeys[aggKey] = true
+		name := sanitizeForName(entry.representative.GroupingName)
+		activeNames[name] = true
 	}
-	if err := m.cleanupStaleGroupingDeviceClasses(ctx, activeKeys); err != nil {
+	if err := m.cleanupStaleGroupingDeviceClasses(ctx, activeNames); err != nil {
 		klog.Errorf("Failed to cleanup stale grouping DeviceClasses: %v", err)
 	}
 
@@ -1232,16 +1236,7 @@ func (m *DeviceClassManager) cleanupStaleGroupingDeviceClasses(ctx context.Conte
 	}
 
 	for _, dc := range classes.Items {
-		grouping := dc.Labels[CoordinatorDriverName+"/grouping"]
-		alignment := dc.Labels[CoordinatorDriverName+"/alignment"]
-		numa := dc.Labels[CoordinatorDriverName+"/numa"]
-
-		key := grouping + "-" + sanitizeForName(alignment)
-		if numa != "" {
-			key += "-numa" + numa
-		}
-
-		if _, exists := active[key]; !exists {
+		if _, exists := active[dc.Name]; !exists {
 			if err := m.client.ResourceV1().DeviceClasses().Delete(ctx, dc.Name, metav1.DeleteOptions{}); err != nil {
 				if !errors.IsNotFound(err) {
 					klog.Errorf("Failed to delete stale grouping DeviceClass %s: %v", dc.Name, err)
