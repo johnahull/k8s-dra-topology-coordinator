@@ -319,16 +319,12 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		}
 	}
 
-	// Compute tier names for pcieroot partitions only. NUMA and other
-	// partition types already have topology-named aggregates; tier names
-	// (eighth, quarter, half) represent fractions of the node's PCIe roots
-	// and only apply to pcieroot-granularity partitions.
+	// Compute tier names for partition types that map to a fraction of PCIe
+	// roots. For pcieroot partitions: 1/N of total roots. For NUMA partitions:
+	// count PCIe roots in the NUMA node / total roots (e.g., 4/8 = half).
 	tierNames := make(map[aggregateKey]string)
 	if pcieRootCount > 0 {
 		for ak, pp := range aggregates {
-			if ak.partType != PartitionPCIeRoot {
-				continue
-			}
 			tierName := computeTierName(ak.partType, pp, allPartitions, ak.profile, pcieRootCount)
 			if tierName != "" {
 				tierNames[ak] = tierName
