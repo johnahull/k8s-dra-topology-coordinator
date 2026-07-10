@@ -221,17 +221,14 @@ func TestPartitionClaimIsExpanded(t *testing.T) {
 	err = json.Unmarshal(reqBytes, &expandedRequests)
 	require.NoError(t, err)
 
-	// Passthrough sub-resources (GPU, RDMA) with count=4 are split into
-	// 4 individual count=1 requests each = 8 total
-	assert.Len(t, expandedRequests, 8, "should have 8 sub-resource requests (4 GPU + 4 RDMA, split from count=4)")
+	assert.Len(t, expandedRequests, 2, "should have 2 sub-resource requests")
 
-	// Verify request names contain the original name prefix and count=1
 	requestNames := make(map[string]bool)
 	for _, r := range expandedRequests {
 		assert.Contains(t, r.Name, "partition-")
 		requestNames[r.Name] = true
 		require.NotNil(t, r.Exactly)
-		assert.Equal(t, int64(1), r.Exactly.Count)
+		assert.Equal(t, int64(4), r.Exactly.Count)
 	}
 
 	// Verify constraints
@@ -321,12 +318,10 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 	err = json.Unmarshal(reqBytes, &expandedRequests)
 	require.NoError(t, err)
 
-	// GPU count=2 always split into 2 individual count=1 requests.
-	// 1 regular + 2 GPU = 3 total.
-	assert.Len(t, expandedRequests, 3)
+	assert.Len(t, expandedRequests, 2)
 
 	foundRegular := false
-	gpuCount := 0
+	foundGPU := false
 	for _, r := range expandedRequests {
 		if r.Name == "regular" {
 			foundRegular = true
@@ -334,14 +329,14 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 			assert.Equal(t, "regular-class", r.Exactly.DeviceClassName)
 		}
 		if strings.Contains(r.Name, "gpu-nvidia-com") {
-			gpuCount++
+			foundGPU = true
 			require.NotNil(t, r.Exactly)
 			assert.Equal(t, "gpu.nvidia.com", r.Exactly.DeviceClassName)
-			assert.Equal(t, int64(1), r.Exactly.Count)
+			assert.Equal(t, int64(2), r.Exactly.Count)
 		}
 	}
 	assert.True(t, foundRegular, "regular request should be preserved")
-	assert.Equal(t, 2, gpuCount, "GPU count=2 should be split into 2 individual requests")
+	assert.True(t, foundGPU, "GPU request should be expanded")
 }
 
 func TestDeviceClassNotFoundReturnsAllow(t *testing.T) {
@@ -488,23 +483,18 @@ func TestExpandClaimDirectly(t *testing.T) {
 	var reqs []resourcev1.DeviceRequest
 	require.NoError(t, json.Unmarshal(reqBytes, &reqs))
 
-	// 4 GPUs + 4 RDMAs split into individual count=1 requests = 8 total
-	assert.Len(t, reqs, 8)
-	gpuCount := 0
-	rdmaCount := 0
-	for _, r := range reqs {
-		require.NotNil(t, r.Exactly)
-		assert.Equal(t, int64(1), r.Exactly.Count)
-		if strings.Contains(r.Name, "gpu-nvidia-com") {
-			assert.Equal(t, "gpu.nvidia.com", r.Exactly.DeviceClassName)
-			gpuCount++
-		} else if strings.Contains(r.Name, "rdma-mellanox-com") {
-			assert.Equal(t, "rdma.mellanox.com", r.Exactly.DeviceClassName)
-			rdmaCount++
-		}
+	assert.Len(t, reqs, 2)
+	expectedNames := map[string]string{
+		"my-partition-gpu-nvidia-com":    "gpu.nvidia.com",
+		"my-partition-rdma-mellanox-com": "rdma.mellanox.com",
 	}
-	assert.Equal(t, 4, gpuCount, "should have 4 individual GPU requests")
-	assert.Equal(t, 4, rdmaCount, "should have 4 individual RDMA requests")
+	for _, r := range reqs {
+		expectedClass, ok := expectedNames[r.Name]
+		assert.True(t, ok, "unexpected request name: %s", r.Name)
+		require.NotNil(t, r.Exactly)
+		assert.Equal(t, expectedClass, r.Exactly.DeviceClassName)
+		assert.Equal(t, int64(4), r.Exactly.Count)
+	}
 }
 
 func TestPreferredConstraintSkippedWhenUnsatisfiable(t *testing.T) {
@@ -573,12 +563,9 @@ func TestPreferredConstraintSkippedWhenUnsatisfiable(t *testing.T) {
 	var constraints []resourcev1.DeviceConstraint
 	require.NoError(t, json.Unmarshal(conBytes, &constraints))
 
-	// NUMA preferred should be skipped. PCIe required should produce 2 per-pair
-	// constraints (gpu-0+rdma, gpu-1+rdma) since GPU count=2 is split.
-	assert.Len(t, constraints, 2, "preferred unsatisfiable constraint should be skipped, 2 per-pair pcieRoot constraints remain")
-	for _, c := range constraints {
-		assert.Equal(t, resourcev1.FullyQualifiedName("resource.kubernetes.io/pcieRoot"), *c.MatchAttribute)
-	}
+	// Only the required PCIe constraint should remain; NUMA preferred should be skipped
+	assert.Len(t, constraints, 1, "preferred unsatisfiable constraint should be skipped")
+	assert.Equal(t, resourcev1.FullyQualifiedName("resource.kubernetes.io/pcieRoot"), *constraints[0].MatchAttribute)
 }
 
 func TestPreferredConstraintEmittedWhenSatisfiable(t *testing.T) {

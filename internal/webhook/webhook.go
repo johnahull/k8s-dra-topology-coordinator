@@ -306,23 +306,13 @@ func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.Dev
 	var subRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 
-	// Build a map of generated request names for constraint resolution.
-	// A device class may produce multiple request names when count>1 is split.
 	requestNameMap := make(map[string][]string)
 
 	for _, sr := range config.SubResources {
 		sanitized := sanitizeDeviceClassName(sr.DeviceClass)
 
-		lc := strings.ToLower(sr.DeviceClass)
-		isPassthrough := strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") ||
-			strings.Contains(lc, "net") || strings.Contains(lc, "sriov") ||
-			strings.Contains(lc, "rdma")
 		splitCount := 1
 		deviceCount := sr.Count
-		if isPassthrough && sr.Count > 1 {
-			splitCount = sr.Count
-			deviceCount = 1
-		}
 
 		for si := 0; si < splitCount; si++ {
 			var name string
@@ -765,11 +755,7 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 						if count > 1 {
 							prefix = fmt.Sprintf("%s-%d", tplReq.Name, i)
 						}
-						if pd.srCount > 1 {
-							requestName = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
-						} else {
-							requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
-						}
+						requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
 
 						deviceName := fmt.Sprintf("%s%d", pd.nameHint, globalDevIdx)
 						globalDevIdx++
