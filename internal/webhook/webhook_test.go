@@ -149,6 +149,10 @@ func TestPartitionClaimIsExpanded(t *testing.T) {
 		},
 		Alignments: []controller.AlignmentConfig{
 			{
+				Attribute: "resource.kubernetes.io/pcieRoot",
+				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+			},
+			{
 				Attribute: controller.AttrNUMANode,
 				Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
 			},
@@ -317,12 +321,11 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 	err = json.Unmarshal(reqBytes, &expandedRequests)
 	require.NoError(t, err)
 
-	// Should have 3 requests: 1 regular + 2 split GPU requests (count=2 → 2x count=1)
-	assert.Len(t, expandedRequests, 3)
+	// No pcieRoot alignment → no split. 1 regular + 1 GPU (count=2)
+	assert.Len(t, expandedRequests, 2)
 
-	// The regular request should be preserved
 	foundRegular := false
-	gpuCount := 0
+	foundGPU := false
 	for _, r := range expandedRequests {
 		if r.Name == "regular" {
 			foundRegular = true
@@ -330,14 +333,14 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 			assert.Equal(t, "regular-class", r.Exactly.DeviceClassName)
 		}
 		if strings.Contains(r.Name, "gpu-nvidia-com") {
-			gpuCount++
+			foundGPU = true
 			require.NotNil(t, r.Exactly)
 			assert.Equal(t, "gpu.nvidia.com", r.Exactly.DeviceClassName)
-			assert.Equal(t, int64(1), r.Exactly.Count)
+			assert.Equal(t, int64(2), r.Exactly.Count)
 		}
 	}
 	assert.True(t, foundRegular, "regular request should be preserved")
-	assert.Equal(t, 2, gpuCount, "GPU count=2 should be split into 2 individual requests")
+	assert.True(t, foundGPU, "GPU request should be expanded")
 }
 
 func TestDeviceClassNotFoundReturnsAllow(t *testing.T) {
