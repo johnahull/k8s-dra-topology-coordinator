@@ -237,6 +237,47 @@ func (ce *ClaimExpander) expandClaim(ctx context.Context, claim *resourcev1.Reso
 		}
 	}
 
+	// Inject VFIO opaque configs for passthrough drivers that don't already
+	// have a config. This tells DRA drivers to bind devices to vfio-pci
+	// during Prepare — needed for KubeVirt VM passthrough.
+	existingConfigDrivers := make(map[string]bool)
+	for _, cfg := range claim.Spec.Devices.Config {
+		if cfg.Opaque != nil {
+			existingConfigDrivers[cfg.Opaque.Driver] = true
+		}
+	}
+	var vfioConfigs []resourcev1.DeviceClaimConfiguration
+	for _, sr := range expandedRequests {
+		if sr.Exactly == nil {
+			continue
+		}
+		driver := sr.Exactly.DeviceClassName
+		if existingConfigDrivers[driver] {
+			continue
+		}
+		vfioConfig := ce.buildVfioConfig(driver)
+		if vfioConfig != nil {
+			vfioConfigs = append(vfioConfigs, *vfioConfig)
+			existingConfigDrivers[driver] = true
+		}
+	}
+	if len(vfioConfigs) > 0 {
+		allConfigs := append(claim.Spec.Devices.Config, vfioConfigs...)
+		if len(claim.Spec.Devices.Config) == 0 {
+			patches = append(patches, jsonPatch{
+				Op:    "add",
+				Path:  "/spec/devices/config",
+				Value: allConfigs,
+			})
+		} else {
+			patches = append(patches, jsonPatch{
+				Op:    "replace",
+				Path:  "/spec/devices/config",
+				Value: allConfigs,
+			})
+		}
+	}
+
 	// Annotate the claim with the expansion mapping so the Pod webhook
 	// can rewrite container request references without re-fetching DeviceClasses.
 	if len(expansionMap) > 0 {
@@ -788,84 +829,6 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 			vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
 			klog.Infof("Auto-generated %d hostDevices for VMI %s/%s from template %s (count=%d)",
 				int(count)*len(passthroughDevices), req.Namespace, vmiName, templateName, count)
-		}
-	}
-
-	// Inject VFIO opaque configs into ResourceClaimTemplates for passthrough
-	// drivers. VMs need VFIO binding but users shouldn't have to know the
-	// driver-specific config format. The webhook injects configs for known
-	// passthrough drivers when a VMI references a template without them.
-	for _, rc := range resourceClaims {
-		rcMap, ok := rc.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		templateName, _ := rcMap["resourceClaimTemplateName"].(string)
-		if templateName == "" {
-			continue
-		}
-
-		tpl, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Get(ctx, templateName, metav1.GetOptions{})
-		if err != nil {
-			continue
-		}
-
-		// Check which passthrough drivers are in the partition config
-		var driversNeedingVfio []string
-		for _, tplReq := range tpl.Spec.Spec.Devices.Requests {
-			if tplReq.Exactly == nil || tplReq.Exactly.DeviceClassName == "" {
-				continue
-			}
-			config, err := ce.getPartitionConfig(ctx, tplReq.Exactly.DeviceClassName)
-			if err != nil || config == nil {
-				continue
-			}
-			for _, sr := range config.SubResources {
-				lc := strings.ToLower(sr.DeviceClass)
-				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") ||
-					strings.Contains(lc, "net") || strings.Contains(lc, "sriov") || strings.Contains(lc, "rdma") {
-					driversNeedingVfio = append(driversNeedingVfio, sr.DeviceClass)
-				}
-			}
-		}
-
-		if len(driversNeedingVfio) == 0 {
-			continue
-		}
-
-		// Check which drivers already have opaque configs in the template
-		existingConfigs := make(map[string]bool)
-		for _, cfg := range tpl.Spec.Spec.Devices.Config {
-			if cfg.Opaque != nil {
-				existingConfigs[cfg.Opaque.Driver] = true
-			}
-		}
-
-		// Build VFIO configs for drivers that don't have one
-		var newConfigs []resourcev1.DeviceClaimConfiguration
-		for _, driver := range driversNeedingVfio {
-			if existingConfigs[driver] {
-				continue
-			}
-			vfioConfig := ce.buildVfioConfig(driver)
-			if vfioConfig != nil {
-				newConfigs = append(newConfigs, *vfioConfig)
-				existingConfigs[driver] = true
-			}
-		}
-
-		if len(newConfigs) > 0 {
-			// Patch the template to add VFIO configs
-			updatedTpl := tpl.DeepCopy()
-			updatedTpl.Spec.Spec.Devices.Config = append(updatedTpl.Spec.Spec.Devices.Config, newConfigs...)
-			_, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Update(ctx, updatedTpl, metav1.UpdateOptions{})
-			if err != nil {
-				klog.Warningf("VMI webhook: failed to update ResourceClaimTemplate %s with VFIO configs: %v", templateName, err)
-			} else {
-				vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
-				klog.Infof("Injected %d VFIO configs into ResourceClaimTemplate %s for VMI %s/%s",
-					len(newConfigs), templateName, req.Namespace, vmiName)
-			}
 		}
 	}
 
