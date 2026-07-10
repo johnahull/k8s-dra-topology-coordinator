@@ -791,6 +791,84 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 		}
 	}
 
+	// Inject VFIO opaque configs into ResourceClaimTemplates for passthrough
+	// drivers. VMs need VFIO binding but users shouldn't have to know the
+	// driver-specific config format. The webhook injects configs for known
+	// passthrough drivers when a VMI references a template without them.
+	for _, rc := range resourceClaims {
+		rcMap, ok := rc.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		templateName, _ := rcMap["resourceClaimTemplateName"].(string)
+		if templateName == "" {
+			continue
+		}
+
+		tpl, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Get(ctx, templateName, metav1.GetOptions{})
+		if err != nil {
+			continue
+		}
+
+		// Check which passthrough drivers are in the partition config
+		var driversNeedingVfio []string
+		for _, tplReq := range tpl.Spec.Spec.Devices.Requests {
+			if tplReq.Exactly == nil || tplReq.Exactly.DeviceClassName == "" {
+				continue
+			}
+			config, err := ce.getPartitionConfig(ctx, tplReq.Exactly.DeviceClassName)
+			if err != nil || config == nil {
+				continue
+			}
+			for _, sr := range config.SubResources {
+				lc := strings.ToLower(sr.DeviceClass)
+				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") ||
+					strings.Contains(lc, "net") || strings.Contains(lc, "sriov") || strings.Contains(lc, "rdma") {
+					driversNeedingVfio = append(driversNeedingVfio, sr.DeviceClass)
+				}
+			}
+		}
+
+		if len(driversNeedingVfio) == 0 {
+			continue
+		}
+
+		// Check which drivers already have opaque configs in the template
+		existingConfigs := make(map[string]bool)
+		for _, cfg := range tpl.Spec.Spec.Devices.Config {
+			if cfg.Opaque != nil {
+				existingConfigs[cfg.Opaque.Driver] = true
+			}
+		}
+
+		// Build VFIO configs for drivers that don't have one
+		var newConfigs []resourcev1.DeviceClaimConfiguration
+		for _, driver := range driversNeedingVfio {
+			if existingConfigs[driver] {
+				continue
+			}
+			vfioConfig := ce.buildVfioConfig(driver)
+			if vfioConfig != nil {
+				newConfigs = append(newConfigs, *vfioConfig)
+				existingConfigs[driver] = true
+			}
+		}
+
+		if len(newConfigs) > 0 {
+			// Patch the template to add VFIO configs
+			updatedTpl := tpl.DeepCopy()
+			updatedTpl.Spec.Spec.Devices.Config = append(updatedTpl.Spec.Spec.Devices.Config, newConfigs...)
+			_, err := ce.client.ResourceV1().ResourceClaimTemplates(req.Namespace).Update(ctx, updatedTpl, metav1.UpdateOptions{})
+			if err != nil {
+				klog.Warningf("VMI webhook: failed to update ResourceClaimTemplate %s with VFIO configs: %v", templateName, err)
+			} else {
+				vmiName, _ := vmi["metadata"].(map[string]interface{})["name"].(string)
+				klog.Infof("Injected %d VFIO configs into ResourceClaimTemplate %s for VMI %s/%s",
+					len(newConfigs), templateName, req.Namespace, vmiName)
+			}
+		}
+	}
+
 	// Also handle existing hostDevices/gpus that need requestName rewriting
 	// (for manually specified devices referencing pre-expansion names)
 	expansionMap := make(map[string]map[string][]string)
@@ -945,6 +1023,38 @@ func escapeJSONPointer(s string) string {
 	s = strings.ReplaceAll(s, "~", "~0")
 	s = strings.ReplaceAll(s, "/", "~1")
 	return s
+}
+
+// buildVfioConfig returns the driver-specific opaque config that tells a DRA
+// driver to bind a device to vfio-pci during Prepare. Returns nil for unknown
+// drivers. The VMI webhook uses this to inject VFIO configs into claim templates
+// so users don't need to know driver-specific config formats.
+func (ce *ClaimExpander) buildVfioConfig(driver string) *resourcev1.DeviceClaimConfiguration {
+	lc := strings.ToLower(driver)
+
+	if strings.Contains(lc, "sriov") || strings.Contains(lc, "net") || strings.Contains(lc, "rdma") {
+		return &resourcev1.DeviceClaimConfiguration{
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driver,
+					Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"sriovnetwork.k8snetworkplumbingwg.io/v1alpha1","kind":"VfConfig","driver":"vfio-pci"}`)},
+				},
+			},
+		}
+	}
+
+	if strings.Contains(lc, "gpu") && (strings.Contains(lc, "amd") || strings.Contains(lc, "1002")) {
+		return &resourcev1.DeviceClaimConfiguration{
+			DeviceConfiguration: resourcev1.DeviceConfiguration{
+				Opaque: &resourcev1.OpaqueDeviceConfiguration{
+					Driver:     driver,
+					Parameters: runtime.RawExtension{Raw: []byte(`{"apiVersion":"gpu.resource.amd.com/v1alpha1","kind":"VfioDeviceConfig"}`)},
+				},
+			},
+		}
+	}
+
+	return nil
 }
 
 // allowResponse returns an admission response that allows the request without mutation.
