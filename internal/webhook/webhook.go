@@ -704,6 +704,8 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 
 	resourceClaims, _ := nestedSlice(vmi, "spec", "resourceClaims")
 	existingHostDevices, _ := nestedSlice(vmi, "spec", "domain", "devices", "hostDevices")
+	hdIdx := len(existingHostDevices)
+	globalDevIdx := 0
 
 	// For each resourceClaim referencing a template, look up the template's
 	// DeviceClass config and auto-generate hostDevices if none exist for it.
@@ -790,15 +792,11 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 					hint = "nic"
 				}
 				if hint != "" {
-					devCount := sr.Count
-					if !vmiNeedsSplit {
-						devCount = 1
-					}
 					passthroughDevices = append(passthroughDevices, struct {
 						class    string
 						nameHint string
 						srCount  int
-					}{sr.DeviceClass, hint, devCount})
+					}{sr.DeviceClass, hint, sr.Count})
 				}
 			}
 
@@ -807,8 +805,6 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 			}
 
 			// Generate hostDevices for each partition instance
-			hdIdx := len(existingHostDevices)
-			globalDevIdx := 0
 			for i := int64(0); i < count; i++ {
 				for _, pd := range passthroughDevices {
 					for si := 0; si < pd.srCount; si++ {
@@ -820,7 +816,7 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 						if count > 1 {
 							prefix = fmt.Sprintf("%s-%d", tplReq.Name, i)
 						}
-						if pd.srCount > 1 {
+						if vmiNeedsSplit && pd.srCount > 1 {
 							requestName = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
 						} else {
 							requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
