@@ -295,60 +295,83 @@ func (ce *ClaimExpander) expandRequest(req resourcev1.DeviceRequest, config *con
 
 // expandSinglePartition expands one partition instance into sub-resource requests
 // and alignment constraints. The prefix determines the naming of generated requests.
+//
+// Passthrough device types (GPU, NIC) with count>1 are split into individual
+// count=1 requests so each gets a unique name. This enables KubeVirt to create
+// one hostDevice per physical device. Non-passthrough devices (CPU, memory)
+// keep their original count since they use consumable capacity, not PCI passthrough.
+// The alignment constraints tie all split requests together so the scheduler
+// places them on the same NUMA/pcieRoot.
 func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.DeviceRequest, config *controller.PartitionConfig) ([]resourcev1.DeviceRequest, []resourcev1.DeviceConstraint) {
 	var subRequests []resourcev1.DeviceRequest
 	var constraints []resourcev1.DeviceConstraint
 
-	// Build a map of generated request names for constraint resolution
-	requestNameMap := make(map[string]string) // subresource device class -> generated request name
+	// Build a map of generated request names for constraint resolution.
+	// A device class may produce multiple request names when count>1 is split.
+	requestNameMap := make(map[string][]string)
 
 	for _, sr := range config.SubResources {
 		sanitized := sanitizeDeviceClassName(sr.DeviceClass)
-		name := prefix + "-" + sanitized
-		requestNameMap[sr.DeviceClass] = name
 
-		count := int64(sr.Count)
-		exact := &resourcev1.ExactDeviceRequest{
-			DeviceClassName: sr.DeviceClass,
-			Count:           count,
+		// Determine if this is a passthrough device type that should be
+		// split into individual requests for KubeVirt compatibility.
+		lc := strings.ToLower(sr.DeviceClass)
+		isPassthrough := strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") ||
+			strings.Contains(lc, "net") || strings.Contains(lc, "sriov") ||
+			strings.Contains(lc, "rdma")
+		splitCount := 1
+		deviceCount := sr.Count
+		if isPassthrough && sr.Count > 1 {
+			splitCount = sr.Count
+			deviceCount = 1
 		}
 
-		// Add capacity requests for shared devices (DRAConsumableCapacity)
-		if len(sr.Capacity) > 0 {
-			exact.Capacity = &resourcev1.CapacityRequirements{
-				Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+		for si := 0; si < splitCount; si++ {
+			var name string
+			if splitCount > 1 {
+				name = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
+			} else {
+				name = prefix + "-" + sanitized
 			}
-			for capName, capVal := range sr.Capacity {
-				qty, err := resource.ParseQuantity(capVal)
-				if err == nil {
-					exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+			requestNameMap[sr.DeviceClass] = append(requestNameMap[sr.DeviceClass], name)
+
+			exact := &resourcev1.ExactDeviceRequest{
+				DeviceClassName: sr.DeviceClass,
+				Count:           int64(deviceCount),
+			}
+
+			// Add capacity requests for shared devices (DRAConsumableCapacity)
+			if len(sr.Capacity) > 0 {
+				exact.Capacity = &resourcev1.CapacityRequirements{
+					Requests: make(map[resourcev1.QualifiedName]resource.Quantity),
+				}
+				for capName, capVal := range sr.Capacity {
+					qty, err := resource.ParseQuantity(capVal)
+					if err == nil {
+						exact.Capacity.Requests[resourcev1.QualifiedName(capName)] = qty
+					}
 				}
 			}
-		}
 
-		// Apply per-driver CEL selectors from the PartitionConfig.
-		// These pin each sub-request to the correct NUMA node using the
-		// driver's own attribute namespace (e.g., gpu.amd.com/numaNode),
-		// eliminating the need for a common cross-driver attribute name.
-		for _, cel := range sr.Selectors {
-			exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
-				CEL: &resourcev1.CELDeviceSelector{
-					Expression: cel,
-				},
+			// Apply per-driver CEL selectors from the PartitionConfig.
+			for _, cel := range sr.Selectors {
+				exact.Selectors = append(exact.Selectors, resourcev1.DeviceSelector{
+					CEL: &resourcev1.CELDeviceSelector{
+						Expression: cel,
+					},
+				})
+			}
+
+			// Forward any user-specified selectors from the original partition request
+			if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
+				exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
+			}
+
+			subRequests = append(subRequests, resourcev1.DeviceRequest{
+				Name:    name,
+				Exactly: exact,
 			})
 		}
-
-		// Forward any user-specified selectors from the original partition request
-		// to each expanded sub-request. This enables NUMA pinning (e.g.,
-		// numaNode==0) and other user-specified device filtering.
-		if req.Exactly != nil && len(req.Exactly.Selectors) > 0 {
-			exact.Selectors = append(exact.Selectors, req.Exactly.Selectors...)
-		}
-
-		subRequests = append(subRequests, resourcev1.DeviceRequest{
-			Name:    name,
-			Exactly: exact,
-		})
 	}
 
 	// Build driver counts map for satisfiability checks
@@ -357,9 +380,19 @@ func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.Dev
 		driverCounts[sr.DeviceClass] = sr.Count
 	}
 
-	// Build constraints from alignments
+	// Build constraints from alignments.
+	// When sub-resources are split (count>1 → individual requests), constraints
+	// need special handling:
+	//
+	// For pcieRoot-type constraints (device-level pairing): create per-index
+	// constraints that pair corresponding devices (gpu-0+nic-0, gpu-1+nic-1).
+	// Each pair must share the same pcieRoot, but different pairs can be on
+	// different roots.
+	//
+	// For numaNode-type constraints (partition-level grouping): create one
+	// global constraint covering all requests. All devices in the partition
+	// must share the same NUMA node.
 	for _, alignment := range config.Alignments {
-		// Skip preferred constraints that cannot be satisfied
 		if alignment.Enforcement == controller.EnforcementPreferred {
 			if ce.model == nil || !ce.model.IsConstraintSatisfiable(alignment.Attribute, driverCounts) {
 				klog.V(2).Infof("Skipping preferred constraint %s: not satisfiable (or no topology model)", alignment.Attribute)
@@ -367,41 +400,86 @@ func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.Dev
 			}
 		}
 
-		var resolvedRequests []string
+		// Collect resolved request names per driver, preserving order
+		type driverRequests struct {
+			driver string
+			names  []string
+		}
+		var perDriver []driverRequests
 		for _, reqName := range alignment.Requests {
-			// Try to resolve the request name through the mapping
 			if mapped, ok := requestNameMap[reqName]; ok {
-				resolvedRequests = append(resolvedRequests, mapped)
+				perDriver = append(perDriver, driverRequests{reqName, mapped})
 			} else {
-				// Use as-is (might be a reference like "partition" or a direct name)
-				// Try prefixing with the original request name
 				found := false
 				for _, sr := range config.SubResources {
 					sanitized := sanitizeDeviceClassName(sr.DeviceClass)
 					if reqName == sanitized {
-						resolvedRequests = append(resolvedRequests, prefix+"-"+sanitized)
+						perDriver = append(perDriver, driverRequests{reqName, []string{prefix + "-" + sanitized}})
 						found = true
 						break
 					}
 				}
 				if !found {
-					// Skip references to the original request name (e.g., "partition")
-					// since it no longer exists after expansion
 					continue
 				}
 			}
 		}
 
-		if len(resolvedRequests) < 2 {
-			// A match constraint needs at least 2 requests to be meaningful
-			continue
+		// Check if any driver has split requests (more than 1 name)
+		maxSplit := 0
+		for _, dr := range perDriver {
+			if len(dr.names) > maxSplit {
+				maxSplit = len(dr.names)
+			}
 		}
 
 		attr := resourcev1.FullyQualifiedName(alignment.Attribute)
-		constraints = append(constraints, resourcev1.DeviceConstraint{
-			Requests:       resolvedRequests,
-			MatchAttribute: &attr,
-		})
+
+		if maxSplit <= 1 {
+			// No splits — single constraint covering all requests
+			var allRequests []string
+			for _, dr := range perDriver {
+				allRequests = append(allRequests, dr.names...)
+			}
+			if len(allRequests) >= 2 {
+				constraints = append(constraints, resourcev1.DeviceConstraint{
+					Requests:       allRequests,
+					MatchAttribute: &attr,
+				})
+			}
+		} else if strings.Contains(string(attr), "numaNode") {
+			// NUMA constraint: global — all devices must share the same NUMA
+			var allRequests []string
+			for _, dr := range perDriver {
+				allRequests = append(allRequests, dr.names...)
+			}
+			if len(allRequests) >= 2 {
+				constraints = append(constraints, resourcev1.DeviceConstraint{
+					Requests:       allRequests,
+					MatchAttribute: &attr,
+				})
+			}
+		} else {
+			// Per-pair constraints (pcieRoot, etc.): pair by index.
+			// gpu-0+nic-0 on same root, gpu-1+nic-1 on same root, etc.
+			for idx := 0; idx < maxSplit; idx++ {
+				var pairRequests []string
+				for _, dr := range perDriver {
+					if idx < len(dr.names) {
+						pairRequests = append(pairRequests, dr.names[idx])
+					} else if len(dr.names) == 1 {
+						// Non-split driver (e.g., CPU) — include in every pair
+						pairRequests = append(pairRequests, dr.names[0])
+					}
+				}
+				if len(pairRequests) >= 2 {
+					constraints = append(constraints, resourcev1.DeviceConstraint{
+						Requests:       pairRequests,
+						MatchAttribute: &attr,
+					})
+				}
+			}
+		}
 	}
 
 	return subRequests, constraints
@@ -648,23 +726,29 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 				count = tplReq.Exactly.Count
 			}
 
-			// Identify passthrough device classes (GPU, NIC — not CPU/memory)
+			// Identify passthrough device classes (GPU, NIC — not CPU/memory).
+			// Respect sr.Count: a half partition may have 4 GPUs and 8 NICs.
+			// Each gets its own hostDevice with a unique request name matching
+			// the split pattern from claim expansion.
 			var passthroughDevices []struct {
 				class    string
 				nameHint string
+				srCount  int
 			}
 			for _, sr := range config.SubResources {
 				lc := strings.ToLower(sr.DeviceClass)
-				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") || strings.Contains(lc, "amd") {
-					passthroughDevices = append(passthroughDevices, struct {
-						class    string
-						nameHint string
-					}{sr.DeviceClass, "gpu"})
+				hint := ""
+				if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") {
+					hint = "gpu"
 				} else if strings.Contains(lc, "net") || strings.Contains(lc, "sriov") || strings.Contains(lc, "rdma") {
+					hint = "nic"
+				}
+				if hint != "" {
 					passthroughDevices = append(passthroughDevices, struct {
 						class    string
 						nameHint string
-					}{sr.DeviceClass, "nic"})
+						srCount  int
+					}{sr.DeviceClass, hint, sr.Count})
 				}
 			}
 
@@ -674,39 +758,48 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 
 			// Generate hostDevices for each partition instance
 			hdIdx := len(existingHostDevices)
+			globalDevIdx := 0
 			for i := int64(0); i < count; i++ {
 				for _, pd := range passthroughDevices {
-					// Build the expanded request name
-					var requestName string
-					sanitized := sanitizeForRequestName(pd.class)
-					if count > 1 {
-						requestName = fmt.Sprintf("%s-%d-%s", tplReq.Name, i, sanitized)
-					} else {
-						requestName = fmt.Sprintf("%s-%s", tplReq.Name, sanitized)
-					}
+					for si := 0; si < pd.srCount; si++ {
+						// Build the expanded request name matching the split
+						// pattern from claim expansion
+						var requestName string
+						sanitized := sanitizeForRequestName(pd.class)
+						prefix := tplReq.Name
+						if count > 1 {
+							prefix = fmt.Sprintf("%s-%d", tplReq.Name, i)
+						}
+						if pd.srCount > 1 {
+							requestName = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
+						} else {
+							requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
+						}
 
-					deviceName := fmt.Sprintf("%s%d", pd.nameHint, i*int64(len(passthroughDevices))+int64(indexOf(pd, passthroughDevices)))
+						deviceName := fmt.Sprintf("%s%d", pd.nameHint, globalDevIdx)
+						globalDevIdx++
 
-					hostDevice := map[string]interface{}{
-						"name":        deviceName,
-						"claimName":   rcName,
-						"requestName": requestName,
-					}
+						hostDevice := map[string]interface{}{
+							"name":        deviceName,
+							"claimName":   rcName,
+							"requestName": requestName,
+						}
 
-					if hdIdx == 0 && len(existingHostDevices) == 0 {
-						patches = append(patches, jsonPatch{
-							Op:    "add",
-							Path:  "/spec/domain/devices/hostDevices",
-							Value: []interface{}{hostDevice},
-						})
-						hdIdx++
-					} else {
-						patches = append(patches, jsonPatch{
-							Op:    "add",
-							Path:  fmt.Sprintf("/spec/domain/devices/hostDevices/-"),
-							Value: hostDevice,
-						})
-						hdIdx++
+						if hdIdx == 0 && len(existingHostDevices) == 0 {
+							patches = append(patches, jsonPatch{
+								Op:    "add",
+								Path:  "/spec/domain/devices/hostDevices",
+								Value: []interface{}{hostDevice},
+							})
+							hdIdx++
+						} else {
+							patches = append(patches, jsonPatch{
+								Op:    "add",
+								Path:  "/spec/domain/devices/hostDevices/-",
+								Value: hostDevice,
+							})
+							hdIdx++
+						}
 					}
 				}
 			}
@@ -840,15 +933,6 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 		PatchType: &patchType,
 		Patch:     patchBytes,
 	}
-}
-
-func indexOf(target struct{ class, nameHint string }, list []struct{ class, nameHint string }) int {
-	for i, item := range list {
-		if item.class == target.class && item.nameHint == target.nameHint {
-			return i
-		}
-	}
-	return 0
 }
 
 func sanitizeForRequestName(s string) string {
