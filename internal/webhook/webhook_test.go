@@ -321,11 +321,12 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 	err = json.Unmarshal(reqBytes, &expandedRequests)
 	require.NoError(t, err)
 
-	// No pcieRoot alignment → no split. 1 regular + 1 GPU (count=2)
-	assert.Len(t, expandedRequests, 2)
+	// GPU count=2 always split into 2 individual count=1 requests.
+	// 1 regular + 2 GPU = 3 total.
+	assert.Len(t, expandedRequests, 3)
 
 	foundRegular := false
-	foundGPU := false
+	gpuCount := 0
 	for _, r := range expandedRequests {
 		if r.Name == "regular" {
 			foundRegular = true
@@ -333,14 +334,14 @@ func TestMixedClaimOnlyExpandsPartition(t *testing.T) {
 			assert.Equal(t, "regular-class", r.Exactly.DeviceClassName)
 		}
 		if strings.Contains(r.Name, "gpu-nvidia-com") {
-			foundGPU = true
+			gpuCount++
 			require.NotNil(t, r.Exactly)
 			assert.Equal(t, "gpu.nvidia.com", r.Exactly.DeviceClassName)
-			assert.Equal(t, int64(2), r.Exactly.Count)
+			assert.Equal(t, int64(1), r.Exactly.Count)
 		}
 	}
 	assert.True(t, foundRegular, "regular request should be preserved")
-	assert.True(t, foundGPU, "GPU request should be expanded")
+	assert.Equal(t, 2, gpuCount, "GPU count=2 should be split into 2 individual requests")
 }
 
 func TestDeviceClassNotFoundReturnsAllow(t *testing.T) {

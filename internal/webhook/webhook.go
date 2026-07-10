@@ -310,35 +310,6 @@ func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.Dev
 	// A device class may produce multiple request names when count>1 is split.
 	requestNameMap := make(map[string][]string)
 
-	// Determine whether splitting is needed. Splitting passthrough devices
-	// (count>1 → individual count=1 requests) is only useful when there are
-	// per-pair alignment constraints (e.g., pcieRoot pairing GPU-0 with NIC-0).
-	// Without per-pair constraints (e.g., full partition spanning all roots),
-	// splitting just creates scheduler overhead with no benefit.
-	needsSplit := false
-	if len(config.Alignments) > 0 {
-		// Check if any alignment is NOT numaNode (numaNode is always global).
-		// Non-numaNode alignments (pcieRoot, etc.) become per-pair when split.
-		for _, a := range config.Alignments {
-			if !strings.Contains(a.Attribute, "numaNode") {
-				// Count how many passthrough drivers are in this alignment
-				passthroughInAlignment := 0
-				for _, reqName := range a.Requests {
-					lc := strings.ToLower(reqName)
-					if strings.Contains(lc, "gpu") || strings.Contains(lc, "nvidia") ||
-						strings.Contains(lc, "net") || strings.Contains(lc, "sriov") ||
-						strings.Contains(lc, "rdma") {
-						passthroughInAlignment++
-					}
-				}
-				if passthroughInAlignment >= 2 {
-					needsSplit = true
-					break
-				}
-			}
-		}
-	}
-
 	for _, sr := range config.SubResources {
 		sanitized := sanitizeDeviceClassName(sr.DeviceClass)
 
@@ -348,7 +319,7 @@ func (ce *ClaimExpander) expandSinglePartition(prefix string, req resourcev1.Dev
 			strings.Contains(lc, "rdma")
 		splitCount := 1
 		deviceCount := sr.Count
-		if needsSplit && isPassthrough && sr.Count > 1 {
+		if isPassthrough && sr.Count > 1 {
 			splitCount = sr.Count
 			deviceCount = 1
 		}
@@ -755,28 +726,6 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 				count = tplReq.Exactly.Count
 			}
 
-			// Determine if claim expansion will split passthrough devices.
-			// Must match the same logic used in expandSinglePartition.
-			vmiNeedsSplit := false
-			for _, a := range config.Alignments {
-				if strings.Contains(a.Attribute, "numaNode") {
-					continue
-				}
-				ptCount := 0
-				for _, rn := range a.Requests {
-					rlc := strings.ToLower(rn)
-					if strings.Contains(rlc, "gpu") || strings.Contains(rlc, "nvidia") ||
-						strings.Contains(rlc, "net") || strings.Contains(rlc, "sriov") ||
-						strings.Contains(rlc, "rdma") {
-						ptCount++
-					}
-				}
-				if ptCount >= 2 {
-					vmiNeedsSplit = true
-					break
-				}
-			}
-
 			// Identify passthrough device classes (GPU, NIC — not CPU/memory).
 			var passthroughDevices []struct {
 				class    string
@@ -816,7 +765,7 @@ func (ce *ClaimExpander) handleVMIAdmission(ctx context.Context, req *admissionv
 						if count > 1 {
 							prefix = fmt.Sprintf("%s-%d", tplReq.Name, i)
 						}
-						if vmiNeedsSplit && pd.srCount > 1 {
+						if pd.srCount > 1 {
 							requestName = fmt.Sprintf("%s-%s-%d", prefix, sanitized, si)
 						} else {
 							requestName = fmt.Sprintf("%s-%s", prefix, sanitized)
