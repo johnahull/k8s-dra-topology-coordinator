@@ -419,12 +419,12 @@ func TestDeviceClassManager_PerDriverCELSelectors(t *testing.T) {
 	// GPU should use gpu.amd.com/numaNode
 	gpuSelectors := selectorMap["gpu.amd.com"]
 	require.Len(t, gpuSelectors, 1)
-	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode == 0`, gpuSelectors[0])
+	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode.includes(0)`, gpuSelectors[0])
 
 	// CPU should use dra.cpu/numaNodeID
 	cpuSelectors := selectorMap["dra.cpu"]
 	require.Len(t, cpuSelectors, 1)
-	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && device.attributes["dra.cpu"].numaNodeID == 0`, cpuSelectors[0])
+	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && device.attributes["dra.cpu"].numaNodeID.includes(0)`, cpuSelectors[0])
 
 	// No NUMA matchAttribute alignment should exist
 	for _, a := range config.Alignments {

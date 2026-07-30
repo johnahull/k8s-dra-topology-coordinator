@@ -255,6 +255,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		// to all partitions via SLIT-distance NUMANodes lists.
 		intersectedCounts := make(map[string]int)
 		intersectedCap := make(map[string]map[string]string)
+		reachableOnly := make(map[string]bool)
 		for driver, seen := range state.driverSeen {
 			if seen == state.total {
 				intersectedCounts[driver] = state.minCounts[driver]
@@ -273,6 +274,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 					count = 1
 				}
 				intersectedCounts[driver] = count
+				reachableOnly[driver] = true
 				if cap, ok := state.minCap[driver]; ok {
 					intersectedCap[driver] = cap
 				}
@@ -285,7 +287,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			DeviceCapacity: intersectedCap,
 			Devices:        state.devices,
 		}
-		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep)
+		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep, reachableOnly)
 		aggregates[ak] = &profilePartition{
 			profile:        state.profile,
 			partType:       state.partType,
@@ -738,7 +740,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 // buildPartitionAggregateConfig builds a PartitionConfig without NUMA/PCIe
 // selectors for aggregate DeviceClasses. Keeps alignment constraints and
 // device counts but lets the scheduler choose placement freely.
-func (m *DeviceClassManager) buildPartitionAggregateConfig(representative PartitionDevice) (PartitionConfig, CouplingLevel) {
+func (m *DeviceClassManager) buildPartitionAggregateConfig(representative PartitionDevice, reachableOnly map[string]bool) (PartitionConfig, CouplingLevel) {
 	config := PartitionConfig{
 		Kind: "PartitionConfig",
 	}
@@ -977,6 +979,12 @@ func isPartitionConstraintSatisfiable(devices []TopologyDevice, attribute string
 // SyncGroupingDeviceClasses creates or updates DeviceClass objects for each
 // satisfiable grouping instance discovered across all nodes.
 func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, results []GroupingResult) error {
+	type groupingKey struct {
+		groupingName string
+		alignment    string
+		numaKey      string
+	}
+
 	type groupingEntry struct {
 		representative GroupingInstance
 		config         PartitionConfig

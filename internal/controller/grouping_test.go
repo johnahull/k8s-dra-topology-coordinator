@@ -9,11 +9,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func makeGroupingConfigMap(name string, data map[string]string) *corev1.ConfigMap {
+func makeGroupingConfigMap(name, namespace string, data map[string]string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: "default",
+			Namespace: namespace,
 			Labels: map[string]string{
 				DeviceGroupingLabel: "true",
 			},
@@ -25,7 +25,7 @@ func makeGroupingConfigMap(name string, data map[string]string) *corev1.ConfigMa
 func TestGroupingStore_LoadFromConfigMap(t *testing.T) {
 	store := NewGroupingStore()
 
-	cm := makeGroupingConfigMap("gpu-dpu-pair", map[string]string{
+	cm := makeGroupingConfigMap("gpu-dpu-pair", "default", map[string]string{
 		"name":      "gpu-dpu-pair",
 		"alignment": "pcieRoot",
 		"fallback":  "numaNode",
@@ -55,7 +55,7 @@ func TestGroupingStore_LoadFromConfigMap(t *testing.T) {
 func TestGroupingStore_LoadFromConfigMap_NoFallback(t *testing.T) {
 	store := NewGroupingStore()
 
-	cm := makeGroupingConfigMap("gpu-only", map[string]string{
+	cm := makeGroupingConfigMap("gpu-only", "default", map[string]string{
 		"name":      "gpu-only",
 		"alignment": "numaNode",
 		"devices": `- class: gpu.amd.com
@@ -73,7 +73,7 @@ func TestGroupingStore_LoadFromConfigMap_NoFallback(t *testing.T) {
 func TestGroupingStore_LoadFromConfigMap_WithCapacity(t *testing.T) {
 	store := NewGroupingStore()
 
-	cm := makeGroupingConfigMap("gpu-cpu", map[string]string{
+	cm := makeGroupingConfigMap("gpu-cpu", "default", map[string]string{
 		"name":      "gpu-cpu",
 		"alignment": "numaNode",
 		"devices": `- class: gpu.amd.com
@@ -111,7 +111,7 @@ func TestGroupingStore_LoadFromConfigMap_Errors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := NewGroupingStore()
-			cm := makeGroupingConfigMap("test", tt.data)
+			cm := makeGroupingConfigMap("test", "default", tt.data)
 			err := store.LoadFromConfigMap(cm)
 			assert.Error(t, err)
 		})
@@ -121,7 +121,7 @@ func TestGroupingStore_LoadFromConfigMap_Errors(t *testing.T) {
 func TestGroupingStore_RemoveConfigMap(t *testing.T) {
 	store := NewGroupingStore()
 
-	cm := makeGroupingConfigMap("test", map[string]string{
+	cm := makeGroupingConfigMap("test", "default", map[string]string{
 		"name":      "test",
 		"alignment": "pcieRoot",
 		"devices":   "- class: gpu.amd.com\n  count: 1",

@@ -574,6 +574,23 @@ func baseDriverName(driverName string) string {
 	return driverName
 }
 
+func countNonEmptyGroups(groups map[string][]TopologyDevice) int {
+	count := 0
+	for key := range groups {
+		if key != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // divideQuantity divides a Kubernetes quantity string by a divisor.
 // Returns the divided quantity as a string, or empty string on failure.
 func divideQuantity(qty string, divisor int) string {

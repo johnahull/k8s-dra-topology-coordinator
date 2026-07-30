@@ -30,6 +30,7 @@ import "k8s.io/apimachinery/pkg/runtime/schema/generated.proto";
 option go_package = "k8s.io/api/batch/v1";
 
 // CronJob represents the configuration of a single cron job.
+// +k8s:supportsSubresource="/status"
 message CronJob {
   // Standard object's metadata.
   // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
@@ -38,7 +39,7 @@ message CronJob {
 
   // Specification of the desired behavior of a cron job, including the schedule.
   // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
-  // +optional
+  // +required
   optional CronJobSpec spec = 2;
 
   // Current status of a cron job.
@@ -61,6 +62,8 @@ message CronJobList {
 // CronJobSpec describes how the job execution will look like and when it will actually run.
 message CronJobSpec {
   // The schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.
+  // +required
+  // +k8s:beta(since: "1.37")=+k8s:required
   optional string schedule = 1;
 
   // The time zone name for the given schedule, see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
@@ -125,6 +128,7 @@ message CronJobStatus {
 }
 
 // Job represents the configuration of a single job.
+// +k8s:supportsSubresource="/status"
 message Job {
   // Standard object's metadata.
   // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
@@ -249,6 +253,8 @@ message JobSpec {
   // It can be null or up to completions. It is required and must be
   // less than or equal to 10^4 when is completions greater than 10^5.
   // +optional
+  // +k8s:optional
+  // +k8s:alpha(since: "1.37")=+k8s:dependentRequired("backoffLimitPerIndex")
   optional int32 maxFailedIndexes = 13;
 
   // A label query over pods that should match the pod count.
@@ -342,9 +348,6 @@ message JobSpec {
   // by RFC 1123. All characters trailing the first "/" must be valid HTTP Path
   // characters as defined by RFC 3986. The value cannot exceed 63 characters.
   // This field is immutable.
-  //
-  // This field is beta-level. The job controller accepts setting the field
-  // when the feature gate JobManagedBy is enabled (enabled by default).
   // +optional
   optional string managedBy = 15;
 }
@@ -409,9 +412,6 @@ message JobStatus {
 
   // The number of pods which are terminating (in phase Pending or Running
   // and have a deletionTimestamp).
-  //
-  // This field is beta-level. The job controller populates the field when
-  // the feature gate JobPodReplacementPolicy is enabled (enabled by default).
   // +optional
   optional int32 terminating = 11;
 
@@ -466,6 +466,7 @@ message JobTemplateSpec {
   // Standard object's metadata of the jobs created from this template.
   // More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
   // +optional
+  // +k8s:opaqueType
   optional .k8s.io.apimachinery.pkg.apis.meta.v1.ObjectMeta metadata = 1;
 
   // Specification of the desired behavior of the job.
@@ -532,6 +533,7 @@ message PodFailurePolicyOnPodConditionsPattern {
   // Specifies the required Pod condition status. To match a pod condition
   // it is required that the specified status equals the pod condition status.
   // Defaults to True.
+  // +optional
   optional string status = 2;
 }
 

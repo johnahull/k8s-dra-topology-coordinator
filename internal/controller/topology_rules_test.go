@@ -352,12 +352,12 @@ func TestTopologyRuleStore_LoadFromConfigMap_InvalidEnforcement(t *testing.T) {
 
 func TestBuildNUMACELSelector_SingleValue(t *testing.T) {
 	cel := BuildNUMACELSelector("gpu.amd.com/numaNode", []int64{0})
-	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode == 0`, cel)
+	assert.Equal(t, `has(device.attributes["gpu.amd.com"].numaNode) && device.attributes["gpu.amd.com"].numaNode.includes(0)`, cel)
 }
 
 func TestBuildNUMACELSelector_MultipleValues(t *testing.T) {
 	cel := BuildNUMACELSelector("dra.cpu/numaNodeID", []int64{0, 1})
-	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && (device.attributes["dra.cpu"].numaNodeID == 0 || device.attributes["dra.cpu"].numaNodeID == 1)`, cel)
+	assert.Equal(t, `has(device.attributes["dra.cpu"].numaNodeID) && (device.attributes["dra.cpu"].numaNodeID.includes(0) || device.attributes["dra.cpu"].numaNodeID.includes(1))`, cel)
 }
 
 func TestBuildNUMACELSelector_InvalidAttribute(t *testing.T) {
@@ -434,53 +434,4 @@ func TestTopologyRuleStore_FallbackAttributeEmpty(t *testing.T) {
 	rules := store.GetRules()
 	require.Len(t, rules, 1)
 	assert.Equal(t, "", rules[0].FallbackAttribute)
-}
-
-func TestTopologyRuleStore_DeviceClassOverride(t *testing.T) {
-	store := NewTopologyRuleStore()
-
-	err := store.LoadFromConfigMap(makeTopologyRuleConfigMap("gpu-vfio", "default", map[string]string{
-		"attribute":   "gpu.amd.com/numaNode",
-		"type":        "int",
-		"driver":      "gpu.amd.com",
-		"deviceClass": "gpu.amd.com-vfio",
-	}))
-	require.NoError(t, err)
-
-	rules := store.GetRules()
-	require.Len(t, rules, 1)
-	assert.Equal(t, "gpu.amd.com-vfio", rules[0].DeviceClass)
-}
-
-func TestTopologyRuleStore_GetDeviceClassForDriver_WithOverride(t *testing.T) {
-	store := NewTopologyRuleStore()
-
-	err := store.LoadFromConfigMap(makeTopologyRuleConfigMap("gpu-vfio", "default", map[string]string{
-		"attribute":   "gpu.amd.com/numaNode",
-		"type":        "int",
-		"driver":      "gpu.amd.com",
-		"deviceClass": "gpu.amd.com-vfio",
-	}))
-	require.NoError(t, err)
-
-	assert.Equal(t, "gpu.amd.com-vfio", store.GetDeviceClassForDriver("gpu.amd.com"))
-}
-
-func TestTopologyRuleStore_GetDeviceClassForDriver_NoOverride(t *testing.T) {
-	store := NewTopologyRuleStore()
-
-	err := store.LoadFromConfigMap(makeTopologyRuleConfigMap("gpu-numa", "default", map[string]string{
-		"attribute": "gpu.amd.com/numaNode",
-		"type":      "int",
-		"driver":    "gpu.amd.com",
-	}))
-	require.NoError(t, err)
-
-	assert.Equal(t, "gpu.amd.com", store.GetDeviceClassForDriver("gpu.amd.com"))
-}
-
-func TestTopologyRuleStore_GetDeviceClassForDriver_NoMatchingRule(t *testing.T) {
-	store := NewTopologyRuleStore()
-
-	assert.Equal(t, "unknown.driver", store.GetDeviceClassForDriver("unknown.driver"))
 }

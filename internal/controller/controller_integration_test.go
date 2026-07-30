@@ -143,6 +143,7 @@ func TestIntegration_ControllerCreatesDeviceClasses(t *testing.T) {
 	// Verify DeviceClasses were created with correct labels
 	for _, dc := range classes {
 		assert.Equal(t, "true", dc.Labels["nodepartition.dra.k8s.io/managed"])
+		assert.NotEmpty(t, dc.Labels["nodepartition.dra.k8s.io/partitionType"])
 		assert.NotEmpty(t, dc.Spec.Selectors, "DeviceClass should have selectors")
 		assert.NotEmpty(t, dc.Spec.Config, "DeviceClass should have config")
 
@@ -153,6 +154,7 @@ func TestIntegration_ControllerCreatesDeviceClasses(t *testing.T) {
 			assert.NoError(t, err, "should unmarshal PartitionConfig")
 			assert.Equal(t, "PartitionConfig", partConfig.Kind)
 			assert.NotEmpty(t, partConfig.SubResources, "should have sub-resources")
+			assert.NotEmpty(t, partConfig.Alignments, "should have alignments")
 		}
 	}
 }

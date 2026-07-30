@@ -39,10 +39,10 @@ import (
 // This API can be used to request client certificates to authenticate to kube-apiserver
 // (with the "kubernetes.io/kube-apiserver-client" signerName),
 // or to obtain certificates from custom non-Kubernetes signers.
-// +k8s:supportsSubresource=/status
-// +k8s:supportsSubresource=/approval
+// +k8s:supportsSubresource="/status"
+// +k8s:supportsSubresource="/approval"
 type CertificateSigningRequest struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
@@ -61,7 +61,6 @@ type CertificateSigningRequest struct {
 type CertificateSigningRequestSpec struct {
 	// request contains an x509 certificate signing request encoded in a "CERTIFICATE REQUEST" PEM block.
 	// When serialized as JSON or YAML, the data is additionally base64-encoded.
-	// +listType=atomic
 	Request []byte `json:"request" protobuf:"bytes,1,opt,name=request"`
 
 	// signerName indicates the requested signer, and is a qualified name.
@@ -180,11 +179,12 @@ type CertificateSigningRequestStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	// +optional
-	// +k8s:listType=map
-	// +k8s:listMapKey=type
-	// +k8s:optional
-	// +k8s:item(type: "Approved")=+k8s:zeroOrOneOfMember
-	// +k8s:item(type: "Denied")=+k8s:zeroOrOneOfMember
+	// +k8s:beta(since: "1.37")=+k8s:listType=map
+	// +k8s:beta(since: "1.37")=+k8s:listMapKey=type
+	// +k8s:beta(since: "1.37")=+k8s:customUnique
+	// +k8s:beta(since: "1.37")=+k8s:optional
+	// +k8s:beta(since: "1.37")=+k8s:item(type: "Approved")=+k8s:zeroOrOneOfMember
+	// +k8s:beta(since: "1.37")=+k8s:item(type: "Denied")=+k8s:zeroOrOneOfMember
 	Conditions []CertificateSigningRequestCondition `json:"conditions,omitempty" protobuf:"bytes,1,rep,name=conditions"`
 
 	// certificate is populated with an issued certificate by the signer after an Approved condition is present.
@@ -214,7 +214,6 @@ type CertificateSigningRequestStatus struct {
 	//     -----END CERTIFICATE-----
 	//     )
 	//
-	// +listType=atomic
 	// +optional
 	Certificate []byte `json:"certificate,omitempty" protobuf:"bytes,2,opt,name=certificate"`
 }
@@ -274,7 +273,7 @@ type CertificateSigningRequestCondition struct {
 
 // CertificateSigningRequestList is a collection of CertificateSigningRequest objects
 type CertificateSigningRequestList struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
 	// +optional
 	metav1.ListMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
