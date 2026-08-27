@@ -222,7 +222,7 @@ For NUMA-aware partitioning, a driver must publish at least one attribute that i
 | Driver | NUMA Attribute | PCIe Attribute | Status |
 |--------|---------------|----------------|--------|
 | [mock-device](https://github.com/fabiendupont/mock-device) | `mock-accel.example.com/numaNode` | `mock-accel.example.com/pciAddress` | Works today (test driver) |
-| [dra-driver-cpu](https://github.com/kubernetes-sigs/dra-driver-cpu) | `dra.cpu/numaNodeID` | N/A | Works today (individual mode) |
+| [dra-driver-cpu](https://github.com/kubernetes-sigs/dra-driver-cpu) | `dra.cpu/numaNodeID` | N/A | Works today (consumable capacity) |
 | [AMD GPU DRA](https://github.com/ROCm/k8s-gpu-dra-driver) | `gpu.amd.com/numaNode` | `resource.kubernetes.io/pcieRoot` | Works today |
 | [NVIDIA GPU DRA](https://github.com/NVIDIA/k8s-dra-driver-gpu) | VFIO type only (`gpu.nvidia.com/numa`) | `resource.kubernetes.io/pcieRoot` | Blocked: no NUMA for standard GPU/MIG types |
 | [dra-driver-memory](https://github.com/kad/dra-driver-memory) | `dra.memory/numaNode` | N/A | Early development |
@@ -230,7 +230,7 @@ For NUMA-aware partitioning, a driver must publish at least one attribute that i
 
 ### Upstream Standardization
 
-There is no `resource.kubernetes.io/numaNode` standard attribute today — each driver uses its own name. The coordinator's topology rules bridge this gap. KEP-5491 proposes standardizing NUMA as a list-typed attribute, which would simplify rules but is not yet merged. The coordinator will continue to add value after standardization through the partition abstraction and automatic claim expansion.
+`resource.kubernetes.io/numaNode` is now a standard attribute (KEP-6072), so drivers that publish it are directly comparable without per-driver mapping. Topology rules still bridge the gap for drivers that have not yet adopted the standard attribute, for PCIe-root alignment (`resource.kubernetes.io/pcieRoot`, KEP-5491, still alpha), and for non-standard grouping attributes such as NVLink domain and socket. The coordinator continues to add value beyond attribute naming through the partition abstraction, live-topology soft affinity, and automatic claim expansion.
 
 ## Prerequisites
 
