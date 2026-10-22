@@ -254,16 +254,17 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		// Merge: ConfigMap-defined groupings override auto-detected ones with the same name
 		mergedGroupings := mergeGroupings(autoGroupings, groupings)
 
-		if len(mergedGroupings) > 0 {
-			groupingResults := c.groupingBuilder.BuildGroupings(mergedGroupings)
+		// Always sync, even with zero groupings: SyncGroupingDeviceClasses still
+		// runs cleanup, so deleting the last grouping ConfigMap removes its
+		// DeviceClasses instead of leaving them orphaned indefinitely.
+		groupingResults := c.groupingBuilder.BuildGroupings(mergedGroupings)
 
-			if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
-				metrics.ReconciliationErrors.Inc()
-				return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
-			}
-
-			groupingCount = countGroupingDeviceClasses(groupingResults)
+		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("failed to sync grouping DeviceClasses: %w", err)
 		}
+
+		groupingCount = countGroupingDeviceClasses(groupingResults)
 	}
 
 	metrics.ReconciliationDuration.Observe(time.Since(start).Seconds())
