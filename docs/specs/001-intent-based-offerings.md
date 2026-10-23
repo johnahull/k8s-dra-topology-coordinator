@@ -1,5 +1,6 @@
 # PR2 Implementation Plan: Intent-Based Hardware Offerings (metadata + discovery + docs)
 
+**Status:** Implemented — see PR #13
 **Handoff target:** codex
 **Repo:** `rh-ecosystem-edge/k8s-dra-topology-coordinator` (Go, Kubernetes DRA)
 **Base branch:** `main` — PR1 (https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/12) has merged. `main` at commit `29591d4` already contains PR1's fixes: `publishDeviceClass` is merge-preserving and idempotent, and opaque-config marshalling is deterministic. PR2's aggregate metadata and no-op tests depend on both, and both are now present on `main`. Branch from `main`.
