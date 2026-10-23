@@ -2,8 +2,8 @@
 
 **Project:** `rh-ecosystem-edge/k8s-dra-topology-coordinator`
 **Feature:** Derived Hardware Capability Summaries
-**Status:** Implementation is blocked on the aggregate-capacity correction in Readiness blocker 1.
-**Prerequisites:** Intent-Based Hardware Offerings metadata enhancement (PR #13) and aggregate count/capacity fixes (PR #14) are merged to `main`. Verify those changes and the additional correction in Readiness blocker 1 are present on the implementation base.
+**Status:** Ready to implement. PR #16 resolved the aggregate-capacity readiness blocker.
+**Prerequisites:** Intent-Based Hardware Offerings metadata enhancement (PR #13), aggregate count/capacity fixes (PR #14), and the aggregate-capacity correction (PR #16) are merged to `main`. Verify these changes are present on the implementation base.
 **Initial scope:** Kubernetes Dynamic Resource Allocation (DRA) DeviceClasses
 **Priority:** High
 
@@ -15,7 +15,7 @@ This spec has been reviewed against the current code, including a separate archi
 
 ### Readiness blockers
 
-1. **Not yet resolved:** aggregate capacity reduction does not preserve missing-key state across all alternatives, and malformed quantities have no valid minimum. See "Code fix 2" below. Do not treat aggregate capacity as guaranteed until the reducer retains absent/invalid state across the full fold and rejects an aggregate whose quantities cannot be compared. Confirmed with a reproducing test against `main`: a capacity key dropped because one alternative lacked it can be silently reintroduced by a later alternative that happens to declare it again — see the fix PR once opened.
+1. ~~Aggregate capacity reduction did not preserve missing-key state across all alternatives, and malformed quantities had no valid minimum. A dropped key could be reintroduced by a later alternative, while an unparseable quantity could be compared lexically.~~ **Resolved by PR #16, merged to `main`:** the reducer keeps dropped-key state across the full fold, so a key absent or unparseable in any alternative stays omitted; valid values are reduced to their numeric minimum. The affected key is dropped without rejecting the aggregate. Regression coverage includes `TestDeviceIntersectionState_DroppedCapacityKeyStaysDropped`, `TestDeviceIntersectionState_DroppedCapacityKeyOrderIndependent`, and `TestDeviceIntersectionState_UnparseableCapacityDropped`.
 2. ~~The 32 KiB summary-pair limit does not ensure the final merged annotation map stays below Kubernetes' 256 KiB combined limit.~~ **Resolved by design decision** — see "Annotation budget" below and the amended FR-2. The check lives in `publishDeviceClass`, is feature-agnostic, and drops Topology Coordinator (TC)-owned annotations in a documented expendability order.
 3. ~~The `unchanged` placeholder sections and the 22-case test inventory are missing.~~ **Resolved** — every placeholder section has been restored verbatim from the original spec draft (§5, FR-4, FR-6, FR-8, FR-10, FR-11, §9, §10, §11, §13), and the 22-case unit-test inventory in §8 is enumerated rather than referenced by count.
 
@@ -42,12 +42,12 @@ Two consequences, both real and both predating this feature:
 - **Nondeterminism.** The aggregate's `Spec.Config` bytes changed between reconciles, so `publishDeviceClass`'s no-op short-circuit never fired for that class and it issued an Update every reconcile — defeating the idempotency work in PR #12.
 - **Incorrectness.** Advertising the larger capacity means claims expanded against the aggregate request more than the smaller partition can supply, and fail to schedule there.
 
-**Partial fix (PR #14, merged to `main`):** capacity values are reduced pairwise with `mergeMinCapacity`. Two gaps remain in the aggregate accumulator and must be fixed before capability summaries can rely on it:
+**Fix (PR #14, completed by PR #16; both merged to `main`):** capacity values are reduced pairwise with `mergeMinCapacity`. PR #16 completed the aggregate accumulator behavior:
 
-- When an alternative lacks a capacity key, the accumulator can delete the empty intersection and later re-add that key from a subsequent alternative. Track absence as terminal state for the full aggregate fold; a key absent from any alternative must stay absent regardless of input order.
-- `resource.Quantity.ParseQuantity` failures currently fall back to lexical order. Lexical order is deterministic but does not identify a numeric minimum. Reject aggregate construction when any contributing capacity value cannot be parsed; return a surfaced per-object error and continue reconciling other classes.
+- When an alternative lacks a capacity key, that key stays absent for the rest of the aggregate fold, regardless of input order.
+- When a capacity value cannot be parsed, the affected key is dropped. The aggregate remains publishable, and no lexical ordering is used as a minimum.
 
-**Consequence for this spec — this supersedes the earlier "omit the summary when capacities differ" policy once the reducer gaps above are fixed.** With driver counts and valid capacity values intersected at the source, an aggregate's `PartitionConfig` can be trusted without adding provenance to the summary schema:
+**Consequence for this spec — this supersedes the earlier "omit the summary when capacities differ" policy.** With driver counts intersected and only valid shared capacity keys retained at the source, an aggregate's `PartitionConfig` can be trusted without adding provenance to the summary schema:
 
 - `BuildCapabilitySummary(config PartitionConfig)` stays a pure function with no provenance or confidence parameter.
 - No omit-on-divergence policy, no uncertainty field in the published schema.
@@ -348,7 +348,7 @@ Requirements:
 - **Before each API create or update, validate the final merged annotation map with `validation.ValidateAnnotationsSize` from the vendored `k8s.io/apimachinery/pkg/api/validation`.** On updates, validate after every conflict retry fetches the latest object and rebuilds the merged annotations, immediately before the update. On failure, drop TC-owned annotations in the documented expendability order (`.../capabilities` first, then `.../capability-summary`, then the intent annotations) until the map validates, logging a surfaced error naming the DeviceClass and keys dropped, then publish the remaining metadata and `Spec.Config`.
 
   The check is feature-agnostic: it consults a package-level ordered list of TC-owned keys, not capability-summary-specific logic. See "Annotation budget" at the top of this document for the full rationale, the drop-order table, and why derived annotations drop before administrator-authored ones.
-- **If summary construction fails for an oversized summary or an invalid per-instance capacity value, omit the summary annotations and log a surfaced error naming the DeviceClass; do not withhold that DeviceClass update.** Omitting the summary keys (and deleting stale values through `mergeTCOwnedMetadata`) still publishes the rest of the DeviceClass, including `Spec.Config`. Aggregate construction with invalid contributing quantities is rejected under FR-5.
+- **If summary construction fails for an oversized summary or an invalid per-instance capacity value, omit the summary annotations and log a surfaced error naming the DeviceClass; do not withhold that DeviceClass update.** Omitting the summary keys (and deleting stale values through `mergeTCOwnedMetadata`) still publishes the rest of the DeviceClass, including `Spec.Config`. Aggregate reduction drops an invalid capacity key and continues publishing the aggregate under FR-5/FR-8.
 
 ### FR-3: Generate Human-Readable Summaries
 
@@ -398,7 +398,7 @@ A description such as "Large AI Inference" must not automatically imply a GPU ty
 
 ### FR-5: Support All TC DeviceClass Types
 
-**[AMENDED — the blocker this whole amendment exists to resolve]**
+**[AMENDED — aggregate-capacity guarantee confirmed by PR #16]**
 
 Generate summaries for:
 
@@ -416,12 +416,12 @@ The following is a required invariant for every aggregate DeviceClass:
 
 > If a class represents alternative physical realizations with different underlying configurations, do not publish one representative configuration as though it is guaranteed for every realization. Either (1) publish explicitly represented configuration variants, with their applicability, or (2) publish only characteristics guaranteed across every alternative. If the existing PartitionConfig does not contain enough information to establish that guarantee, block the summary for that class and report the limitation rather than inferring uniformity.
 
-**Current status:** driver presence and counts are intersected. Capacity is not yet guaranteed until the accumulator and malformed-quantity gaps in "Code fix 2" are corrected. The implementation must satisfy option (2) — publish only characteristics guaranteed across every alternative — for every aggregate type:
+**Current status:** PR #14 and PR #16 establish the required invariant for the aggregate types below. The implementation must publish only characteristics guaranteed across every alternative:
 
 - Partition-type aggregates (pcieroot/numa) and tier-named aggregates: intersect driver presence and counts, with an SLIT-reachability carve-out for NUMA-shareable drivers; capacity must retain only keys present in every alternative and reduce valid quantities to their per-key minimum.
 - Grouping aggregates: apply the same capacity and count rules, without the NUMA-SLIT carve-out (no grouping-alignment equivalent).
 
-Once the reducer enforces this invariant, `BuildCapabilitySummary` can trust its `PartitionConfig` input without a provenance parameter. **Do not add a `Representative`/`Guaranteed` boolean field to `CapabilitySummary`**; correct heterogeneous handling belongs in the aggregate configuration builder.
+`BuildCapabilitySummary` can trust its `PartitionConfig` input without a provenance parameter. **Do not add a `Representative`/`Guaranteed` boolean field to `CapabilitySummary`**; correct heterogeneous handling belongs in the aggregate configuration builder.
 
 If a future aggregate type is added that cannot be made to intersect, the correct response is the one this spec has given from the start: block capability-summary annotation on that specific aggregate type until it can be fixed, rather than adding a permanent escape hatch to the published schema.
 
@@ -463,7 +463,7 @@ Requirements:
 - Preserve qualified capacity keys.
 - Preserve exact capacity quantities.
 - Parse quantities to compare alternatives; preserve the selected input string verbatim and do not normalize its units.
-- Treat an unparseable quantity as invalid. `BuildCapabilitySummary` returns an error for it, and aggregate construction must fail if any contributing alternative contains one; do not use lexical ordering as a minimum.
+- Treat an unparseable quantity as invalid. `BuildCapabilitySummary` returns an error if its input contains one. Aggregate reduction drops the affected capacity key and continues publishing the aggregate; do not use lexical ordering as a minimum.
 - Avoid floating-point conversions.
 - Do not confuse requested capacity with total device capacity.
 - Do not confuse DeviceClass eligibility with current resource availability.
@@ -491,7 +491,7 @@ The summary communicates what is requested.
 
 It does not guarantee the scheduler can satisfy that request at the current moment.
 
-**[AMENDED]** Aggregate reduction compares valid quantities with `resource.Quantity.Cmp` and selects one of the input strings verbatim. It does not sum, scale, or unit-convert values for display. Invalid inputs cannot be ordered into a trustworthy minimum and must fail aggregate construction.
+**[AMENDED]** Aggregate reduction compares valid quantities with `resource.Quantity.Cmp` and selects one of the input strings verbatim. It does not sum, scale, or unit-convert values for display. If a quantity cannot be parsed, the affected capacity key is omitted from the aggregate; other valid shared keys remain available.
 
 ### FR-9: Deterministic Output
 
@@ -659,7 +659,7 @@ Beyond the original inventory, add tests that cover:
 
 - An aggregate whose alternatives have differing valid capacities summarizes the intersected minimum.
 - A capacity key absent from the first, middle, or final alternative remains absent from the aggregate regardless of input order; cover at least three alternatives so a later input cannot reintroduce a key after the intersection becomes empty.
-- An aggregate with any unparseable contributing quantity returns an error and is not published.
+- An aggregate with an unparseable capacity value omits that key, retains other valid shared capacities, and is still published.
 - For valid quantities, per-instance summaries preserve the configured capacity map unchanged.
 - Determinism when aggregate input order changes and capacities differ.
 - Summary `Kind` copies `PartitionConfig.Kind`; the grouping, partition, and tier DeviceClass names do not affect it.
@@ -749,7 +749,7 @@ This feature is metadata generation and discovery only.
 - [ ] Documentation includes working discovery examples.
 - [ ] No additional controller or CRD is introduced.
 
-**[AMENDED]** This criterion is not met until the aggregate-capacity gaps in Readiness blocker 1 are fixed and covered by the tests in §8. Once fixed, heterogeneous summaries publish only fields guaranteed across every alternative; no uncertainty field is needed.
+**[AMENDED]** The aggregate-capacity invariant is implemented by PR #16 and covered by the regression tests in §8. Heterogeneous summaries publish only fields guaranteed across every alternative; no uncertainty field is needed.
 
 "Existing ResourceClaim expansion behavior is unchanged" needs one qualification: the capacity intersection fix *did* change the capacity values in aggregate DeviceClasses' `Spec.Config`, which claim expansion consumes. That change is a bug fix landed separately from this feature (aggregates previously advertised a nondeterministic, sometimes-unsatisfiable capacity); this feature itself introduces no further change to expansion.
 
@@ -757,7 +757,7 @@ This feature is metadata generation and discovery only.
 
 ## 12. Instructions for Claude Code / implementing agent
 
-**[AMENDED]** PR #13 and PR #14 are merged to `main`; verify both are present on the implementation base. PR #14 does not fully satisfy the capacity guarantee: implement the additional reducer corrections in "Code fix 2" and Readiness blocker 1 before capability summaries trust aggregate configs. Implement within the existing controller and DeviceClass publishing paths; follow the validation and delivery requirements in this specification.
+**[AMENDED]** PRs #13, #14, and #16 are merged to `main`; verify they are present on the implementation base. PR #16 completes the aggregate-capacity guarantee described in "Code fix 2" and Readiness blocker 1. Implement capability summaries within the existing controller and DeviceClass publishing paths; follow the validation and delivery requirements in this specification.
 
 ---
 
