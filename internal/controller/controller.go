@@ -575,20 +575,31 @@ func detectSanitizedNameCollisions(groupings []DeviceGrouping) map[string][]Devi
 }
 
 func detectGroupingDeviceClassNameCollisions(results []GroupingResult) map[string][]string {
-	ownersByName := make(map[string]map[string]struct{})
+	seen := make(map[string]bool)
+	var representatives []GroupingInstance
 	for _, result := range results {
 		for _, instance := range result.Instances {
-			groupingName := instance.GroupingName
-			classNames := []string{
-				sanitizeForName(groupingName),
-				fmt.Sprintf("%s-rail%d", sanitizeForName(groupingName), instance.RailIndex),
+			key := groupingInstanceKey(instance)
+			if seen[key] {
+				continue
 			}
-			for _, className := range classNames {
-				if ownersByName[className] == nil {
-					ownersByName[className] = make(map[string]struct{})
-				}
-				ownersByName[className][groupingName] = struct{}{}
+			seen[key] = true
+			representatives = append(representatives, instance)
+		}
+	}
+
+	ownersByName := make(map[string]map[string]struct{})
+	for _, instance := range representatives {
+		groupingName := instance.GroupingName
+		classNames := []string{
+			sanitizeForName(groupingName),
+			fmt.Sprintf("%s-rail%d", sanitizeForName(groupingName), instance.RailIndex),
+		}
+		for _, className := range classNames {
+			if ownersByName[className] == nil {
+				ownersByName[className] = make(map[string]struct{})
 			}
+			ownersByName[className][groupingName] = struct{}{}
 		}
 	}
 

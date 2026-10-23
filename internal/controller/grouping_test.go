@@ -71,6 +71,41 @@ func TestParseDeviceGrouping_IntentMetadata(t *testing.T) {
 		assert.Equal(t, "internal", grouping.Intent.Visibility)
 	})
 
+	t.Run("whitespace-only lists are empty", func(t *testing.T) {
+		data := validGroupingData("test")
+		data["categories"] = " , \t,  "
+		data["workloadTypes"] = "\t, , "
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+		require.NoError(t, err)
+		assert.Empty(t, grouping.Intent.Categories)
+		assert.Empty(t, grouping.Intent.WorkloadTypes)
+		assert.False(t, grouping.Intent.IsOffering())
+	})
+
+	t.Run("unique list limit applies after deduplication", func(t *testing.T) {
+		data := validGroupingData("test")
+		unique := uniqueList(1, 16)
+		data["categories"] = unique + "," + unique
+		data["workloadTypes"] = unique + "," + unique
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+		require.NoError(t, err)
+		want := strings.Split(unique, ",")
+		assert.Equal(t, want, grouping.Intent.Categories)
+		assert.Equal(t, want, grouping.Intent.WorkloadTypes)
+	})
+
+	t.Run("unicode list items count code points after trimming", func(t *testing.T) {
+		data := validGroupingData("test")
+		category := strings.Repeat("é", 63)
+		workloadType := strings.Repeat("界", 63)
+		data["categories"] = " \t" + category + "  "
+		data["workloadTypes"] = " \t" + workloadType + "  "
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+		require.NoError(t, err)
+		assert.Equal(t, []string{category}, grouping.Intent.Categories)
+		assert.Equal(t, []string{workloadType}, grouping.Intent.WorkloadTypes)
+	})
+
 	t.Run("maximum boundaries", func(t *testing.T) {
 		data := validGroupingData("test")
 		data["displayName"] = strings.Repeat("é", 63)
@@ -103,8 +138,10 @@ func TestParseDeviceGrouping_InvalidIntentMetadata(t *testing.T) {
 		{name: "description too long", field: "description", value: strings.Repeat("x", 1025)},
 		{name: "too many categories", field: "categories", value: uniqueList(1, 17)},
 		{name: "category too long", field: "categories", value: strings.Repeat("x", 64)},
+		{name: "unicode category too long", field: "categories", value: strings.Repeat("é", 64)},
 		{name: "too many workload types", field: "workloadTypes", value: uniqueList(1, 17)},
 		{name: "workload type too long", field: "workloadTypes", value: strings.Repeat("x", 64)},
+		{name: "unicode workload type too long", field: "workloadTypes", value: strings.Repeat("界", 64)},
 	}
 
 	for _, tt := range tests {
@@ -158,11 +195,14 @@ func TestGroupingStore_GetGroupingsDeepCopiesIntent(t *testing.T) {
 	first := store.GetGroupings()
 	require.Len(t, first, 1)
 	require.NotEmpty(t, first[0].Intent.Categories)
+	require.NotEmpty(t, first[0].Intent.WorkloadTypes)
 	first[0].Intent.Categories[0] = "mutated"
+	first[0].Intent.WorkloadTypes[0] = "mutated"
 
 	second := store.GetGroupings()
 	require.Len(t, second, 1)
 	assert.Equal(t, []string{"gpu", "inference"}, second[0].Intent.Categories)
+	assert.Equal(t, []string{"training", "serving"}, second[0].Intent.WorkloadTypes)
 }
 
 func TestGroupingStore_LoadFromConfigMap(t *testing.T) {

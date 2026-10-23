@@ -1026,15 +1026,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	for _, result := range results {
 		for _, inst := range result.Instances {
 			config := m.buildGroupingConfig(inst)
-
-			nk := numaKey(inst.NUMANodes)
-			pk := strings.Join(inst.PCIeRoots, "-")
-			key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
-			if pk != "" {
-				key += "-" + sanitizeForName(pk)
-			} else if nk != "" {
-				key += "-numa" + nk
-			}
+			key := groupingInstanceKey(inst)
 
 			if entry, ok := seen[key]; ok {
 				entry.count++
@@ -1117,6 +1109,18 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 
 	klog.Infof("Synced %d grouping DeviceClasses", len(seen))
 	return stdliberrors.Join(publishErrs...)
+}
+
+func groupingInstanceKey(inst GroupingInstance) string {
+	nk := numaKey(inst.NUMANodes)
+	pk := strings.Join(inst.PCIeRoots, "-")
+	key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
+	if pk != "" {
+		key += "-" + sanitizeForName(pk)
+	} else if nk != "" {
+		key += "-numa" + nk
+	}
+	return key
 }
 
 // buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.

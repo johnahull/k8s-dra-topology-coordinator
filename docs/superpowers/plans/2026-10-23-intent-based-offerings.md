@@ -30,12 +30,12 @@
 ## Review Focus
 
 - A leading digit, dotted raw name such as `gpu.nvidia.com`, and consecutive internal hyphens such as `gpu--nic` are valid after sanitization; test them as accepted. Reject an underscore, `-gpu`, `gpu-`, or a sanitized name over 56 characters.
-- Empty, whitespace-only, repeated, and over-limit list values normalize or fail as specified; pin normalization order and limits in parser tests.
+- Empty and whitespace-only lists normalize to empty; repeated raw entries are deduplicated before the 16-item limit; trimming happens before Unicode code-point length validation; pin first-seen order and 63/64-code-point boundaries with multibyte parser tests.
 - Mutating either metadata slice returned by `GetGroupings()` must not mutate the store's cached grouping.
 - Missing metadata and auto-detected groupings produce no intent keys; aggregate classes omit `railIndex`; rail classes receive no intent keys.
 - Removing configured metadata removes the coordinator-owned key while preserving foreign labels/annotations and leaving `Spec.Config` unchanged.
 - Exact raw-name duplicates are diagnosed only among user groupings; distinct raw names that sanitize identically are diagnosed after merge and excluded from the build input.
-- Different grouping names must not emit the same aggregate/per-rail DeviceClass name (for example, `gpu` and `gpu-rail0`); detect satisfiable output-name collisions before sync and preserve existing classes.
+- Different grouping names must not emit the same aggregate/per-rail DeviceClass name (for example, `gpu`'s emitted `gpu-rail0` and another grouping's aggregate `gpu-rail0`); detect collisions only among manager-published representative rails after applying the same coalescing key, and preserve existing classes on a real collision.
 
 ---
 
@@ -88,7 +88,7 @@
 
 - [ ] **Step 1: Add `TestController_Reconcile_DuplicateUserNamesLogsActionableError`** with two user-defined ConfigMaps sharing `data.name`; capture logs and assert they identify the field, raw name, and both source ConfigMaps. Include a user-defined grouping that exactly overrides an auto-detected grouping and assert it is not reported as a duplicate.
 - [ ] **Step 2: Add `TestController_Reconcile_SanitizedCollisionPreservesExistingDeviceClass`**. Seed the fake client with an existing managed grouping DeviceClass, load ConfigMaps named `gpu.inference` and `gpu-inference`, call `reconcile`, and assert it returns an actionable error while preserving the existing DeviceClass.
-- [ ] **Step 3: Add `TestController_Reconcile_GeneratedNameCollisionPreservesExistingDeviceClass`**. Use satisfiable groupings named `gpu` and `gpu-rail0`, seed an existing managed `gpu-rail0` class, and assert reconciliation returns an actionable error without changing that class.
+- [ ] **Step 3: Add generated-name collision tests**. Use satisfiable groupings named `gpu` and `gpu-rail0`, seed an existing managed `gpu-rail0` class, and assert reconciliation returns an actionable error without changing that class. Also cover `gpu` and `gpu-rail1` on one PCIe root with two same-root devices: the manager coalesces `gpu` instances and emits only `gpu-rail0`, so `gpu-rail1` remains a valid aggregate name and reconciliation succeeds.
 - [ ] **Step 4: Add `TestGroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping`**. Load a valid grouping, call the update handler with invalid metadata, capture the error log, and verify that it names the ConfigMap/stale cache and that the previous grouping remains available.
 - [ ] **Step 5: Run the focused controller tests** with `go test ./internal/controller -run 'Test(Controller_Reconcile_(DuplicateUserNamesLogsActionableError|SanitizedCollisionPreservesExistingDeviceClass|GeneratedNameCollisionPreservesExistingDeviceClass)|GroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping)'`. Expected: tests compile and fail because the diagnostics/recovery and stale-cache log are not implemented.
 - [ ] **Step 6: Implement duplicate-name detection** inside `if !skipGroupings`, on the user-defined slice only and before merge. Log `field=data.name`, duplicate raw name, and source ConfigMaps at error level; do not abort reconciliation or change exact-name override behavior.

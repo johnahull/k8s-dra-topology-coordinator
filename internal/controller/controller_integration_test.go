@@ -188,6 +188,10 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	require.Equal(t, "ai,inference", deviceClass.Annotations[categoriesKey])
 	require.Equal(t, "training,serving", deviceClass.Annotations[workloadTypesKey])
 	originalConfig := deviceClass.Spec.Config
+	deviceClass.Labels["foreign.example.com/team"] = "platform"
+	deviceClass.Annotations["foreign.example.com/owner"] = "controller"
+	deviceClass, err = client.ResourceV1().DeviceClasses().Update(ctx, deviceClass, metav1.UpdateOptions{})
+	require.NoError(t, err)
 
 	grouping, err = client.CoreV1().ConfigMaps("default").Get(ctx, grouping.Name, metav1.GetOptions{})
 	require.NoError(t, err)
@@ -198,17 +202,23 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 		return dc.Annotations[displayNameKey] == "AI training accelerator"
 	})
 	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
+	assert.Equal(t, "platform", deviceClass.Labels["foreign.example.com/team"])
+	assert.Equal(t, "controller", deviceClass.Annotations["foreign.example.com/owner"])
 
 	grouping, err = client.CoreV1().ConfigMaps("default").Get(ctx, grouping.Name, metav1.GetOptions{})
 	require.NoError(t, err)
 	delete(grouping.Data, "description")
+	delete(grouping.Data, "visibility")
 	_, err = client.CoreV1().ConfigMaps("default").Update(ctx, grouping, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
 		_, exists := dc.Annotations[descriptionKey]
-		return !exists
+		_, hasVisibility := dc.Labels[visibilityKey]
+		return !exists && !hasVisibility
 	})
 	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
+	assert.Equal(t, "platform", deviceClass.Labels["foreign.example.com/team"])
+	assert.Equal(t, "controller", deviceClass.Annotations["foreign.example.com/owner"])
 
 	cancel()
 	require.NoError(t, <-done)
@@ -217,7 +227,8 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	cancel, done = startController()
 	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
 		_, hasDescription := dc.Annotations[descriptionKey]
-		return dc.Labels[intentLevelKey] == "workload" && dc.Annotations[displayNameKey] == "AI training accelerator" && !hasDescription
+		_, hasVisibility := dc.Labels[visibilityKey]
+		return dc.Labels[intentLevelKey] == "workload" && dc.Annotations[displayNameKey] == "AI training accelerator" && !hasDescription && !hasVisibility
 	})
 	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
 }
