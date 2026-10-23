@@ -3,7 +3,7 @@
 **Project:** `rh-ecosystem-edge/k8s-dra-topology-coordinator`
 **Feature:** Derived Hardware Capability Summaries
 **Status:** Proposed — amended after spec review and architect review against the actual codebase
-**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main` as of this amendment); **and** `fix/grouping-aggregate-intersection` (committed, see "Resolved blocker" below) — this feature cannot be safely implemented without it.
+**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main` as of this amendment); **and** the grouping-aggregate intersection fix (PR #14, https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged — see "Resolved blocker" below) — this feature cannot be safely implemented without it.
 **Initial scope:** Kubernetes DRA DeviceClasses
 **Priority:** High
 
