@@ -1396,3 +1396,168 @@ func TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic(
 			"buildPartitionConfig must marshal identically across calls with multiple match-constraint rules, iteration %d", i)
 	}
 }
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Rail 0 has gpu+nic+nvme; rail 1 has only gpu, and with a lower count.
+	// The aggregate must publish only what's guaranteed on every rail: gpu
+	// at the minimum count (1), and nic/nvme excluded entirely since they're
+	// not present on rail 1. Without intersection, the aggregate would
+	// arbitrarily publish whichever rail's full config happened to "win" by
+	// lowest RailIndex, misrepresenting rail 1's actual (lesser) capability.
+	rail0 := multiDeviceGroupingInstance(0)
+	rail1 := GroupingInstance{
+		Name:         "node-1-gpu-nic-pair-pcieroot-1",
+		NodeName:     "node-1",
+		GroupingName: "gpu-nic-pair",
+		Alignment:    "pcieRoot",
+		PCIeRoots:    []string{"pci0000:01"},
+		DeviceCounts: map[string]int{
+			"gpu.nvidia.com": 2, // higher count than rail0's 1 -> min must win
+		},
+		RailIndex: 1,
+	}
+
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{rail0, rail1}},
+	}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	var config PartitionConfig
+	require.NoError(t, json.Unmarshal(dc.Spec.Config[0].Opaque.Parameters.Raw, &config))
+
+	classes := make(map[string]SubResourceConfig, len(config.SubResources))
+	for _, sr := range config.SubResources {
+		classes[sr.DeviceClass] = sr
+	}
+
+	require.Contains(t, classes, "gpu.nvidia.com", "gpu is present on every rail, must survive intersection")
+	assert.Equal(t, 1, classes["gpu.nvidia.com"].Count, "aggregate count must be the minimum across rails, not rail1's higher count")
+
+	assert.NotContains(t, classes, "rdma.mellanox.com", "nic is absent from rail1, must not appear in the aggregate")
+	assert.NotContains(t, classes, "nvme.example.com", "nvme is absent from rail1, must not appear in the aggregate")
+}
+
+func TestDeviceClassManager_AggregateCapacityIsMinimumAndDeterministic(t *testing.T) {
+	// Two PCIe-root partitions under one aggregate key, same driver, different
+	// capacity - exactly what partition_builder.go's
+	// divideQuantity(capVal, numRoots) produces when a node's NUMA nodes have
+	// different PCIe-root counts.
+	//
+	// Before the fix, the aggregate took whichever partition came last in map
+	// iteration order, so the published capacity (and therefore Spec.Config,
+	// and therefore publishDeviceClass's no-op check) varied between
+	// reconciles, and could advertise 16 when one partition supplies only 8.
+	results := func() []PartitionResult {
+		return []PartitionResult{{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{
+					Name: "p-root0", Type: PartitionPCIeRoot, Profile: "test",
+					DeviceCounts:   map[string]int{"dra.cpu": 1},
+					DeviceCapacity: map[string]map[string]string{"dra.cpu": {"dra.cpu/cpu": "16"}},
+					NUMANodes:      []int64{0},
+					PCIeRoots:      []string{"pci0000:00"},
+				},
+				{
+					Name: "p-root1", Type: PartitionPCIeRoot, Profile: "test",
+					DeviceCounts:   map[string]int{"dra.cpu": 1},
+					DeviceCapacity: map[string]map[string]string{"dra.cpu": {"dra.cpu/cpu": "8"}},
+					NUMANodes:      []int64{1},
+					PCIeRoots:      []string{"pci0000:80"},
+				},
+			},
+		}}
+	}
+
+	observed := make(map[string]int)
+	for i := 0; i < 40; i++ {
+		client := fake.NewSimpleClientset()
+		manager := NewDeviceClassManager(client, CoordinatorDriverName, NewTopologyRuleStore())
+		require.NoError(t, manager.SyncDeviceClasses(context.Background(), results()))
+
+		dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "pcieroot", metav1.GetOptions{})
+		require.NoError(t, err)
+
+		var config PartitionConfig
+		require.NoError(t, json.Unmarshal(dc.Spec.Config[0].Opaque.Parameters.Raw, &config))
+		for _, sr := range config.SubResources {
+			if sr.DeviceClass == "dra.cpu" {
+				observed[sr.Capacity["dra.cpu/cpu"]]++
+			}
+		}
+	}
+
+	require.Len(t, observed, 1, "aggregate capacity must not vary with map iteration order, saw %v", observed)
+	assert.Equal(t, 40, observed["8"],
+		"aggregate must advertise the minimum capacity satisfiable on every partition, saw %v", observed)
+}
+
+func TestMergeMinCapacity(t *testing.T) {
+	tests := []struct {
+		name                     string
+		existing, incoming, want map[string]string
+	}{
+		{
+			name:     "per-key minimum",
+			existing: map[string]string{"dra.cpu/cpu": "16"},
+			incoming: map[string]string{"dra.cpu/cpu": "8"},
+			want:     map[string]string{"dra.cpu/cpu": "8"},
+		},
+		{
+			name:     "minimum regardless of argument order",
+			existing: map[string]string{"dra.cpu/cpu": "8"},
+			incoming: map[string]string{"dra.cpu/cpu": "16"},
+			want:     map[string]string{"dra.cpu/cpu": "8"},
+		},
+		{
+			name:     "compares by quantity value, not string",
+			existing: map[string]string{"memory/mem": "1Gi"},
+			incoming: map[string]string{"memory/mem": "900Mi"},
+			want:     map[string]string{"memory/mem": "900Mi"},
+		},
+		{
+			name:     "key missing on one side is dropped as unguaranteed",
+			existing: map[string]string{"dra.cpu/cpu": "16", "dra.cpu/extra": "1"},
+			incoming: map[string]string{"dra.cpu/cpu": "8"},
+			want:     map[string]string{"dra.cpu/cpu": "8"},
+		},
+		{
+			name:     "nil incoming means capacity is not guaranteed",
+			existing: map[string]string{"dra.cpu/cpu": "16"},
+			incoming: nil,
+			want:     nil,
+		},
+		{
+			name:     "nil existing means capacity is not guaranteed",
+			existing: nil,
+			incoming: map[string]string{"dra.cpu/cpu": "16"},
+			want:     nil,
+		},
+		{
+			name:     "no shared keys yields nil",
+			existing: map[string]string{"a/x": "1"},
+			incoming: map[string]string{"b/y": "2"},
+			want:     nil,
+		},
+		{
+			name:     "unparseable values fall back to a stable lexical choice",
+			existing: map[string]string{"vendor/thing": "zzz"},
+			incoming: map[string]string{"vendor/thing": "aaa"},
+			want:     map[string]string{"vendor/thing": "aaa"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, mergeMinCapacity(tt.existing, tt.incoming))
+		})
+	}
+}
