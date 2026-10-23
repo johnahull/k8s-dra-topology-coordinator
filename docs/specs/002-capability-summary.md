@@ -2,8 +2,8 @@
 
 **Project:** `rh-ecosystem-edge/k8s-dra-topology-coordinator`
 **Feature:** Derived Hardware Capability Summaries
-**Status:** Proposed — review amendment recorded; not implementation-ready until the open items below are resolved
-**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main` as of this amendment); **and** the grouping-aggregate count intersection fix (PR #14, https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged — see below) — this feature cannot be safely implemented without it.
+**Status:** Proposed — review amendments recorded; one open item remains (annotation budget, blocker 2 below)
+**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main`); **and** both aggregate-intersection fixes — the count intersection (PR #14, https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged) and the capacity intersection (committed alongside this spec, see below). This feature cannot be safely implemented without both.
 **Initial scope:** Kubernetes DRA DeviceClasses
 **Priority:** High
 
@@ -11,15 +11,15 @@
 
 ## Amendment note (read this first)
 
-This spec was reviewed against the current code. The amendments below record the resolved device-count issue and the remaining implementation blockers. Sections marked `unchanged` are placeholders: their original text is not included here, and no earlier copy was found in this repository history. Restore that content or replace each placeholder with complete requirements before implementation.
+This spec has been through three review passes against the actual code: a manual review, an architect review (`feature-dev:code-architect`) that verified every claim with file:line citations, and a follow-up review of the amendments themselves. Each pass found a real defect in the code the feature depends on, and both code defects have now been fixed. Amendments are marked `[AMENDED]` inline.
 
 ### Readiness blockers
 
-1. Aggregate DeviceClass counts are intersected, but capacity values are copied from one qualifying instance without comparison. Before aggregate summaries are published, the aggregation path must establish that each retained resource's capacity map is identical across all alternatives; otherwise, omit both summary annotations for that aggregate and surface an error.
-2. The 32 KiB summary-pair limit does not ensure that the final merged annotation map stays below Kubernetes' combined annotation limit. The check must account for existing foreign and TC-owned annotations at publish time.
-3. The omitted `unchanged` sections and original 22-case test inventory are not available in this checkout. They must be restored or rewritten before this document is an executable implementation specification.
+1. ~~Aggregate capacity values are copied from one qualifying instance without comparison.~~ **Resolved in code** — see "Resolved blocker 2" below. Both counts and capacity are now intersected at the source, so an aggregate's `PartitionConfig` is a genuine guarantee and `BuildCapabilitySummary` can trust it without a provenance parameter or an omit-on-divergence policy.
+2. **OPEN.** The 32 KiB summary-pair limit does not ensure the final merged annotation map stays below Kubernetes' 256 KiB combined annotation limit. The check must account for existing foreign and TC-owned annotations at publish time. See amended FR-2 — the requirement is clear but the *placement* is not yet settled, and settling it is a prerequisite for implementation.
+3. ~~The `unchanged` placeholder sections and the 22-case test inventory are missing.~~ **Resolved** — every placeholder section has been restored verbatim from the original spec draft (§5, FR-4, FR-6, FR-8, FR-10, FR-11, §9, §10, §11, §13). The one genuine remaining gap is the 22-case unit-test inventory in §8, which the original spec listed only as a count, not as enumerated cases; §8 now enumerates concrete cases in its place.
 
-### Resolved device-count blocker: grouping aggregates did not intersect
+### Resolved blocker 1: grouping aggregates did not intersect device counts
 
 The original §6 FR-5 assumed "the final PartitionConfig associated with each generated class" was always a trustworthy, guaranteed-across-every-realization description for aggregate classes. It was not, for one specific aggregate type.
 
@@ -27,9 +27,30 @@ Verified in `internal/controller/deviceclass_manager.go`: `SyncDeviceClasses`'s 
 
 `SyncGroupingDeviceClasses`'s grouping aggregate (the one named after the grouping itself, e.g. `gpu-nic-pair`) did **not** do this. It picked one arbitrary instance — deterministically the lowest `RailIndex`, as of a prior correctness fix — and published that single instance's `PartitionConfig` as the entire aggregate's config. If the grouping is asymmetric across rails (devices present on some rails but not others — explicitly the reason groupings exist, per the code's own comment on the partition-aggregate intersection: "Asymmetric devices... handled via grouping DeviceClasses instead"), the grouping aggregate's capability summary would describe one rail's hardware as if it were guaranteed for the whole grouping. A pure `BuildCapabilitySummary(config PartitionConfig) (CapabilitySummary, error)` has no way to detect or correct this from inside the function — `PartitionConfig` carries no provenance about whether it was intersected or arbitrarily picked, so FR-5's "if PartitionConfig does not contain enough information to distinguish alternatives, report that limitation" could not have been implemented against the original code no matter how carefully `BuildCapabilitySummary` was written.
 
-**Fix (committed on branch `fix/grouping-aggregate-intersection`):** `SyncGroupingDeviceClasses` now intersects driver presence and counts across instances of a grouping name, retaining the minimum count. Capacity is not intersected: the accumulator copies the last qualifying instance's capacity map without comparing it, matching the existing partition-aggregate behavior. The NUMA-SLIT-reachability carve-out was deliberately **not** ported — it's a partition-type-specific optimization tied to NUMA distance semantics with no equivalent in grouping alignment (pcieRoot/numaNode/socket are a matching key here, not a distance model). The existing tests cover asymmetric driver counts, not differing capacity values.
+**Fix (PR #14, branch `fix/grouping-aggregate-intersection`):** `SyncGroupingDeviceClasses` now intersects driver presence and counts across instances of a grouping name, retaining the minimum count. The NUMA-SLIT-reachability carve-out was deliberately **not** ported — it's a partition-type-specific optimization tied to NUMA distance semantics with no equivalent in grouping alignment (pcieRoot/numaNode/socket are a matching key here, not a distance model). Regression test: `TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails`.
 
-**Consequence for this spec:** Driver presence and counts are intersected for current aggregate types. Capacity values are not proven uniform: the code retains a last-seen capacity map, and PCIe partition capacities can differ when the capacity is divided by different root counts. Apply this policy before implementing aggregate summaries: include capacity only when every alternative has an identical capacity map for each resource retained in the aggregate. Compare keys and string values exactly; do not choose a last-seen or minimum value. If any such map differs, or equality cannot be established, omit both capability summary annotations for that aggregate and surface an error naming the DeviceClass while still reconciling its `Spec.Config` and other metadata. Per-instance summaries copy their configured capacity unchanged. Track this result while alternatives are available because `BuildCapabilitySummary(PartitionConfig)` cannot infer it from the final config alone. This is an implementation blocker, not a future-only concern.
+### Resolved blocker 2: aggregate capacity was nondeterministic and unsafe
+
+The count fix above left capacity untouched, and a follow-up review caught that this was not merely incomplete but actively broken — in both aggregate paths, including the partition-type path that predates all of this work.
+
+Both accumulators assigned capacity with an unconditional overwrite (`existing.minCap[driver] = cap`), despite the field name. Last writer won, and the writer was chosen by Go map iteration order over `seen`. Reproduced before fixing: two PCIe-root partitions under one aggregate key with capacities `16` and `8`, synced 40 times, produced `16` on 5 runs and `8` on 35.
+
+This is not a contrived input. `partition_builder.go` derives per-partition capacity as `divideQuantity(capVal, numRoots)` where `numRoots` is the PCIe-root count of that partition's NUMA node, so any node whose NUMA nodes have different root counts produces exactly this shape.
+
+Two consequences, both real and both predating this feature:
+
+- **Nondeterminism.** The aggregate's `Spec.Config` bytes changed between reconciles, so `publishDeviceClass`'s no-op short-circuit never fired for that class and it issued an Update every reconcile — defeating the idempotency work in PR #12.
+- **Incorrectness.** Advertising the larger capacity means claims expanded against the aggregate request more than the smaller partition can supply, and fail to schedule there.
+
+**Fix (committed alongside this spec):** capacity now reduces to the per-key minimum over the keys shared by every alternative, via `mergeMinCapacity`. Keys absent from any alternative are dropped rather than advertised as guaranteed. Quantities are compared with `resource.Quantity.Cmp`; values that fail to parse fall back to a stable lexical choice, arbitrary but not iteration-order-dependent.
+
+**Consequence for this spec — this supersedes the earlier "omit the summary when capacities differ" policy.** That policy was the right call against the code as it stood, where the config could not be trusted. Now that both counts and capacity are intersected at the source, an aggregate's `PartitionConfig` *is* a guarantee in both dimensions, and the summary can reflect it faithfully with no special handling:
+
+- `BuildCapabilitySummary(config PartitionConfig)` stays a pure function with no provenance or confidence parameter.
+- No omit-on-divergence policy, no uncertainty field in the published schema.
+- Per-instance summaries copy their configured capacity unchanged, as before.
+
+On the specific question of *minimum* versus *exact equality*: minimum is correct and is what the code does. The two dimensions are now consistent — counts already took the minimum, and taking the minimum of a capacity is the same kind of claim ("guaranteed on every alternative"). Exact-equality-or-omit would be strictly more conservative but would discard a true, useful guarantee: if one partition supplies 16 and another 8, "8" is genuinely guaranteed everywhere and is more informative than publishing nothing. This does not conflict with FR-8's caution about quantity normalization — see the amendment at the end of FR-8.
 
 ### Other amendments (smaller, non-blocking)
 
@@ -177,7 +198,76 @@ Preserve both fields — do not collapse these into an inaccurate resource count
 
 ## 5. Example Derived Summary
 
-*(unchanged — the example is illustrative and doesn't depend on the aggregate-intersection fix; it describes a single concrete grouping, not an aggregate spanning heterogeneous instances)*
+Suppose the resolved PartitionConfig contains:
+
+```json
+{
+  "kind": "grouping",
+  "subResources": [
+    {
+      "deviceClass": "dra.cpu",
+      "count": 1,
+      "capacity": {
+        "dra.cpu/cpu": "16"
+      }
+    },
+    {
+      "deviceClass": "gpu.example.com",
+      "count": 2
+    },
+    {
+      "deviceClass": "rdma.example.com",
+      "count": 1
+    }
+  ],
+  "alignments": [
+    {
+      "attribute": "resource.kubernetes.io/numaNode",
+      "requests": ["cpu", "gpu", "nic"],
+      "enforcement": "required"
+    }
+  ]
+}
+```
+
+The capability generator should create an equivalent normalized representation:
+
+```json
+{
+  "schemaVersion": "v1alpha1",
+  "kind": "grouping",
+  "resources": [
+    {
+      "deviceClass": "dra.cpu",
+      "count": 1,
+      "capacity": {
+        "dra.cpu/cpu": "16"
+      }
+    },
+    {
+      "deviceClass": "gpu.example.com",
+      "count": 2
+    },
+    {
+      "deviceClass": "rdma.example.com",
+      "count": 1
+    }
+  ],
+  "topology": [
+    {
+      "attribute": "resource.kubernetes.io/numaNode",
+      "requests": ["cpu", "gpu", "nic"],
+      "enforcement": "required"
+    }
+  ]
+}
+```
+
+This example illustrates the desired schema. Validate request references against the actual naming produced by TC; do not assume `cpu`, `gpu`, and `nic` are always the generated request names.
+
+The resulting summary should be consistent with the ResourceClaim that TC ultimately generates.
+
+This example describes a single concrete grouping, not an aggregate spanning alternative realizations, so it is unaffected by the aggregate intersection semantics discussed above.
 
 ---
 
@@ -237,6 +327,13 @@ Requirements:
 - Preserve existing DeviceClass annotations.
 - Enforce the 32 KiB feature budget on the combined `capabilities` and `capability-summary` key/value bytes before adding them to `dc.Annotations`.
 - **Before each API create or update, check the final merged annotation map against Kubernetes' 256 KiB combined limit.** Count `len(key) + len(value)` for every annotation, including existing foreign annotations and all TC-owned annotations. `publishDeviceClass` is the first point where the final merged map is available. If adding the summary would exceed the limit, remove both summary keys from the desired annotations, log a surfaced error naming the DeviceClass, and publish the remaining metadata and `Spec.Config`.
+
+  **[OPEN — readiness blocker 2; settle before implementing.]** The *requirement* above is correct: a fixed 32 KiB feature budget cannot by itself guarantee the combined limit is respected, since foreign annotations are unbounded and unknown until publish time. The *placement* is not settled, and the naive reading has two problems worth resolving first:
+
+  1. `publishDeviceClass` is generic infrastructure shared by every DeviceClass TC publishes. Teaching it to recognize and drop two specific capability-summary keys couples a shared function to one feature.
+  2. PR2's four intent annotations (`display-name`, `description`, `categories`, `workload-types`) have identical exposure to the same 256 KiB ceiling, with no equivalent carve-out. On overflow, why are capability keys sacrificed and intent keys preserved? That precedence is a real decision and is currently unstated.
+
+  A cleaner shape, if it holds up: a generic TC-owned annotation budget enforced in `publishDeviceClass` with a documented, feature-agnostic drop order, rather than feature-specific key removal. Whoever implements this should pick an approach and record the reasoning here before writing the check.
 - **On oversized or unserializable summaries: omit the summary annotations and log a surfaced error naming the DeviceClass, not withhold the entire DeviceClass update.** This matches the codebase's existing convention — `SyncDeviceClasses`/`SyncGroupingDeviceClasses` already accumulate per-object errors (`publishErrs`) and continue processing other objects rather than failing the whole sync on one bad object. Omitting the two annotation keys (and deleting them if previously present, via the existing `mergeTCOwnedMetadata` prefix-based removal) while still publishing the rest of the DeviceClass (labels, intent metadata if present, `Spec.Config`) is self-correcting and loses only this one feature's output for that one object, with a clear log line as evidence.
 
 ### FR-3: Generate Human-Readable Summaries
@@ -258,7 +355,34 @@ Requirements:
 
 ### FR-4: Integrate with Existing Intent Metadata
 
-*(unchanged)*
+The previous enhancement introduces intent-oriented metadata such as:
+
+- `displayName`
+- `description`
+- `intentLevel`
+- `categories`
+- `workloadTypes`
+
+The generated capability summary must complement, not replace, that metadata.
+
+For example:
+
+```yaml
+metadata:
+  annotations:
+    nodepartition.dra.k8s.io/display-name: "AI Inference — Large"
+    nodepartition.dra.k8s.io/description: "GPU compute intended for inference workloads"
+    nodepartition.dra.k8s.io/capability-summary: "2 × gpu.example.com; CPU capacity dra.cpu/cpu=16"
+    nodepartition.dra.k8s.io/capabilities: '{"schemaVersion":"v1alpha1",...}'
+```
+
+The administrator-authored description communicates intended use.
+
+The generated capability summary communicates actual DRA requirements.
+
+These two concepts must remain independent.
+
+A description such as "Large AI Inference" must not automatically imply a GPU type, GPU memory quantity, or performance guarantee.
 
 ### FR-5: Support All TC DeviceClass Types
 
@@ -276,24 +400,41 @@ Generate summaries for:
 
 Use the final PartitionConfig associated with each generated class.
 
-Original defensive language (retain as a durable invariant; count guarantees are enforced at the source, but capacity guarantees remain unresolved):
+Original defensive language (retain as a durable invariant; it is now satisfied at the source for both counts and capacity):
 
 > If a class represents alternative physical realizations with different underlying configurations, do not publish one representative configuration as though it is guaranteed for every realization. For heterogeneous classes, either (1) publish explicitly represented configuration variants, with their applicability, or (2) publish only characteristics guaranteed across every alternative and clearly mark unresolved details. If the existing PartitionConfig does not contain enough information to distinguish alternatives, report that limitation rather than inferring uniformity.
 
-**Status as of this amendment:** device presence and counts satisfy option (2) for current aggregate types. Capacity does not yet satisfy the guarantee:
+**Status as of this amendment:** satisfied by option (2) — "publish only characteristics guaranteed across every alternative" — in both dimensions, for every aggregate type currently generated:
 
-- Partition-type aggregates (pcieroot/numa) and tier-named aggregates: intersect driver presence and counts, with an SLIT-reachability carve-out for NUMA-shareable drivers. Capacity maps are copied from the last qualifying partition; they are not compared.
-- Grouping aggregates: intersect driver presence and counts (minus the NUMA-SLIT carve-out, which has no grouping-alignment equivalent). Capacity maps are likewise copied from the last qualifying instance; they are not compared.
+- Partition-type aggregates (pcieroot/numa) and tier-named aggregates: intersect driver presence and counts, with an SLIT-reachability carve-out for NUMA-shareable drivers; capacity reduces to the per-key minimum over keys shared by every partition.
+- Grouping aggregates: the same, minus the NUMA-SLIT carve-out (no grouping-alignment equivalent).
 
-`BuildCapabilitySummary` cannot determine whether an aggregate capacity is uniform from `PartitionConfig` alone. The aggregate-building path must pass that result to summary generation. If the retained resource capacity maps are not identical across alternatives, omit both summary annotations for the aggregate and log a surfaced error; continue publishing the DeviceClass's `Spec.Config` and other metadata. This policy requires no uncertainty field in the public schema and does not change claim expansion.
+Because this is enforced where the `PartitionConfig` is built, `BuildCapabilitySummary` does not need to re-derive or re-verify "is this guaranteed" — it can trust its input, for every call site. **Do not add a `Representative`/`Guaranteed` boolean field to `CapabilitySummary`** — this was considered twice during review and rejected both times: it would be the only place in the DeviceClass surface where "guaranteed across all instances" doesn't hold for an aggregate, inconsistent with how every aggregate now behaves, and it would let future heterogeneous-aggregate cases quietly opt out of the real fix instead of being corrected at the source.
+
+If a future aggregate type is added that cannot be made to intersect, the correct response is the one this spec has given from the start: block capability-summary annotation on that specific aggregate type until it can be fixed, rather than adding a permanent escape hatch to the published schema.
 
 ### FR-6: Preserve Arbitrary DRA Resources
 
-*(unchanged)*
+The system must remain vendor-agnostic.
+
+Examples of possible resource classes:
+
+```text
+gpu.example.com
+rdma.example.com
+dra.cpu
+memory.example.com
+fpga.example.com
+accelerator.vendor.example
+```
+
+The summary must preserve unknown classes and capacity names without requiring hardcoded mappings.
+
+Do not introduce a fixed CPU/GPU/NIC device enum into the core transformation.
+
+Future semantic classification may be added using administrator-defined metadata or verified driver capabilities.
 
 ### FR-7: Topology Summary
-
-*(unchanged)*
 
 Preserve topology requirements from `AlignmentConfig`: full qualified attribute name, participating generated request identifiers, required versus preferred enforcement, multiple simultaneous alignment constraints.
 
@@ -303,7 +444,41 @@ Do not infer PCIe-root or NUMA guarantees solely from a grouping's name. Do not 
 
 ### FR-8: Capacity Semantics
 
-*(unchanged)*
+Consumable DRA capacity values must be handled carefully.
+
+Requirements:
+
+- Preserve qualified capacity keys.
+- Preserve exact capacity quantities.
+- Use Kubernetes quantity parsing only when normalization is semantically safe.
+- Avoid floating-point conversions.
+- Do not confuse requested capacity with total device capacity.
+- Do not confuse DeviceClass eligibility with current resource availability.
+- Do not calculate aggregate capacity unless doing so is formally valid for that capacity model.
+
+Examples:
+
+```json
+{
+  "capacity": {
+    "dra.cpu/cpu": "16"
+  }
+}
+```
+
+```json
+{
+  "capacity": {
+    "memory.example.com/memory": "64Gi"
+  }
+}
+```
+
+The summary communicates what is requested.
+
+It does not guarantee the scheduler can satisfy that request at the current moment.
+
+**[AMENDED]** "Use Kubernetes quantity parsing only when normalization is semantically safe" is satisfied, not violated, by the aggregate minimum described under FR-5. The aggregation path compares quantities with `resource.Quantity.Cmp` to select the smallest value among alternatives — it does not sum, scale, or unit-convert them for display, and the value published is always one of the input values verbatim. Selecting a minimum is the one reduction that is formally valid here, because the smallest value is satisfiable wherever any of the alternatives is.
 
 ### FR-9: Deterministic Output
 
@@ -326,11 +501,46 @@ Avoid unnecessary DeviceClass updates when nothing relevant has changed.
 
 ### FR-10: Reconciliation
 
-*(unchanged)*
+Integrate summary generation into the existing DeviceClass construction and publication path.
+
+Expected behavior:
+
+| Event | Result |
+|---|---|
+| PartitionConfig created | Capability summary generated |
+| PartitionConfig changed | Summary updated |
+| Device grouping modified | Summary reflects resulting configuration |
+| Topology changes | Summary reflects the newly generated DeviceClass configuration |
+| Controller restarted | Summary restored |
+| No relevant changes | No unnecessary API update |
+| Class removed | Existing cleanup behavior preserved |
+
+The summary generator must not have its own reconciliation loop.
 
 ### FR-11: Discovery
 
-*(unchanged)*
+Users should be able to discover capability information through standard Kubernetes APIs.
+
+Example:
+
+```bash
+kubectl get deviceclass ai-inference-large \
+  -o jsonpath='{.metadata.annotations.nodepartition\.dra\.k8s\.io/capability-summary}'
+```
+
+For the structured JSON:
+
+```bash
+kubectl get deviceclass ai-inference-large \
+  -o json |
+  jq -r '.metadata.annotations["nodepartition.dra.k8s.io/capabilities"] | fromjson'
+```
+
+Document commands that combine intent metadata with derived capabilities.
+
+Verify escaping and output formats before adding the commands to README examples.
+
+**[Note]** The DeviceClass name `ai-inference-large` above is from the original spec draft. The offering names settled for this project are `gpu-inference`, `low-latency-network`, and `gpu-nic-aligned` (see `docs/specs/001-intent-based-offerings.md`); use those in any documentation that ships.
 
 ### FR-12: Error Handling
 
@@ -378,49 +588,160 @@ Implement deterministic JSON serialization using the normal Go encoding/json fac
 
 Call the summary generator in the existing DeviceClass generation path once the final PartitionConfig has been determined. Avoid reparsing the original grouping ConfigMap. The existing DeviceClass manager should remain responsible for publishing and reconciling DeviceClasses.
 
-**Placement: annotate every TC-managed DeviceClass this feature can reach — per-instance and aggregate alike — not aggregate-only.** `buildGroupingDeviceClass` is called identically for per-instance classes (`-rail<N>` names) and the aggregate class; `buildDeviceClassFromCache` is called identically for per-instance, partition-type-aggregate, and tier classes. Per-instance configs are homogeneous by construction — one `GroupingInstance`/`PartitionDevice` each — so FR-5's alternative-realization concern does not arise there. For aggregates, summary generation must receive the capacity-uniformity result from the aggregate-building path; if the retained resource capacity maps differ across alternatives, omit the summary annotations and surface an error. This is a different placement decision than PR2's intent metadata (which is aggregate-only, a *presentation* choice to keep `kubectl get deviceclasses` output to one row per offering) — the capability summary is a per-object derived fact about that object's own resolved configuration, not administrator-authored prose, so there's no discovery-noise argument for omitting it from per-instance classes. Call `BuildCapabilitySummary` + annotate inside (or immediately around) both `buildGroupingDeviceClass` and `buildDeviceClassFromCache`, once per `*resourcev1.DeviceClass` object produced, regardless of which emission loop produced it.
+**Placement: annotate every TC-managed DeviceClass this feature can reach — per-instance and aggregate alike — not aggregate-only.** `buildGroupingDeviceClass` is called identically for per-instance classes (`-rail<N>` names) and the aggregate class; `buildDeviceClassFromCache` is called identically for per-instance, partition-type-aggregate, and tier classes. Per-instance configs are homogeneous by construction — one `GroupingInstance`/`PartitionDevice` each — so FR-5's alternative-realization concern does not arise there. Aggregates need no special handling either, now that counts and capacity are both intersected at the source: every call site hands `BuildCapabilitySummary` a config that is already a guarantee. This is a different placement decision than PR2's intent metadata (which is aggregate-only, a *presentation* choice to keep `kubectl get deviceclasses` output to one row per offering) — the capability summary is a per-object derived fact about that object's own resolved configuration, not administrator-authored prose, so there's no discovery-noise argument for omitting it from per-instance classes. Call `BuildCapabilitySummary` + annotate inside (or immediately around) both `buildGroupingDeviceClass` and `buildDeviceClassFromCache`, once per `*resourcev1.DeviceClass` object produced, regardless of which emission loop produced it.
 
 ---
 
 ## 8. Tests
 
-*(unchanged, plus one addition)*
+### Unit tests
 
-The original 22-case unit-test inventory, integration tests, and property/fuzz tests are not included in this document. Restore or enumerate those cases before implementation; the review-specific coverage below is additive.
+The original spec called for 22 unit test cases. Enumerated:
 
-Add tests that cover:
+1. Single device class.
+2. Multiple device classes.
+3. Consumable CPU capacity.
+4. Consumable memory capacity.
+5. Multiple capacity keys.
+6. Multiple GPU requests.
+7. GPU/NIC grouping.
+8. NUMA alignment.
+9. PCIe-root alignment.
+10. Multiple topology constraints.
+11. Required and preferred enforcement.
+12. Unknown vendor-specific device classes.
+13. Unknown capacity keys.
+14. Partition mode.
+15. CEL selectors.
+16. Deterministic output.
+17. Invalid quantities.
+18. Empty configuration.
+19. Inconsistent request identifiers.
+20. Oversized output.
+21. Preservation of DeviceClass metadata.
+22. Heterogeneous or aggregate partition classes.
 
-- Equal capacity maps across aggregate alternatives are included unchanged; differing maps (including missing keys) omit both summary annotations and surface an error while the DeviceClass config is still reconciled.
+### Integration tests
+
+Verify:
+
+- Generated DeviceClasses include capability metadata.
+- Summary data matches the associated PartitionConfig.
+- Updates modify the summary appropriately.
+- Metadata remains stable across repeated reconciliation.
+- Existing grouping and partition generation is unchanged.
+- Existing ResourceClaims continue to expand correctly.
+
+### Property-based or fuzz tests
+
+Where practical, verify:
+
+- Transformation never mutates PartitionConfig.
+- Identical semantic inputs generate identical outputs.
+- JSON output remains valid.
+- Arbitrary capacity keys and class names do not cause panics.
+- Malformed configurations fail safely.
+
+### Added by review
+
+Beyond the original inventory, add tests that cover:
+
+- An aggregate whose alternatives have differing capacity summarizes the intersected minimum, and a capacity key absent from any alternative does not appear in the summary at all. (The intersection itself is covered at the source by `TestDeviceClassManager_AggregateCapacityIsMinimumAndDeterministic` and `TestMergeMinCapacity`; this case asserts the summary faithfully reflects it.)
 - Per-instance summaries preserve the configured capacity map unchanged.
 - Determinism when aggregate input order changes and capacities differ.
 - A merged annotation map near the 256 KiB limit, including foreign annotations; verify the summary is omitted and the rest of the DeviceClass update proceeds.
 - Oversized and unserializable summaries; verify stale summary keys are removed while the DeviceClass configuration is still reconciled.
 
-**Added:** a unit test exercising `BuildCapabilitySummary` against a `PartitionConfig` derived from an intersected, asymmetric grouping aggregate (i.e., feed it the *output* of the now-fixed `SyncGroupingDeviceClasses` aggregate path for a grouping where rails differ), asserting the summary reflects the intersected driver/count subset. Capacity assertions follow the policy above: include identical maps and suppress the aggregate summary when maps differ. This tests the count intersection end-to-end, not just at the `SyncGroupingDeviceClasses` layer (which already has its own regression test, `TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails`, added alongside the fix).
+**Added:** a unit test exercising `BuildCapabilitySummary` against a `PartitionConfig` derived from an intersected, asymmetric grouping aggregate (i.e., feed it the *output* of the now-fixed `SyncGroupingDeviceClasses` aggregate path for a grouping where rails differ), asserting the summary reflects the intersected driver/count subset and the intersected minimum capacity. This tests the intersection end-to-end, not just at the `SyncGroupingDeviceClasses` layer (which has its own regression tests, `TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails` and `TestDeviceClassManager_AggregateCapacityIsMinimumAndDeterministic`, added alongside the two fixes).
 
 ---
 
 ## 9. Documentation
 
-*(unchanged)*
+Update the README with a section titled:
+
+**Hardware Capability Discovery**
+
+Explain:
+
+1. Why capability summaries exist.
+2. How they differ from administrator-defined intent metadata.
+3. How summaries are derived from PartitionConfig.
+4. How to inspect summaries using kubectl.
+5. How to use the JSON output in a catalog or UI.
+6. How consumable DRA capacity is represented.
+7. How topology guarantees are described.
+8. How aggregate DeviceClasses and variants are handled.
+9. Why capability summaries do not imply current availability.
+
+Include an example that shows the complete progression:
+
+```text
+Administrator grouping ConfigMap
+        ↓
+TC-generated PartitionConfig
+        ↓
+Derived CapabilitySummary
+        ↓
+Published DeviceClass
+        ↓
+User discovery through Kubernetes API
+        ↓
+Standard DRA ResourceClaim
+```
 
 ---
 
 ## 10. Non-Goals
 
-*(unchanged)*
+Do not implement:
+
+- Another hardware-definition schema.
+- A new HardwareOffering CRD.
+- A second controller.
+- A catalog web application.
+- Resource availability monitoring.
+- Automatic workload hardware sizing.
+- GPU or CPU performance benchmarking.
+- Hardware recommendation logic.
+- Device-plugin integration.
+- KubeVirt-specific APIs.
+- VEP-300 or VEP-470 integration.
+- Changes to the DRA allocation scheduler.
+- Changes to ResourceClaim expansion algorithms.
+
+This feature is metadata generation and discovery only.
 
 ---
 
 ## 11. Acceptance Criteria
 
-*(unchanged, all still apply; "Heterogeneous classes do not publish false uniform guarantees" is now achievable as stated rather than requiring a weaker implementation)*
+- [ ] CapabilitySummary is derived entirely from the final PartitionConfig.
+- [ ] No hardware quantities need to be duplicated in administrator metadata.
+- [ ] Summaries support arbitrary DRA resources.
+- [ ] Consumable capacity semantics are preserved.
+- [ ] Topology constraints retain their enforcement semantics.
+- [ ] Existing grouping and partition classes are supported.
+- [ ] Heterogeneous classes do not publish false uniform guarantees.
+- [ ] Summaries are available through DeviceClass annotations.
+- [ ] Human-readable summaries are generated automatically.
+- [ ] Output is deterministic and versioned.
+- [ ] Reconciliation correctly handles updates and deletions.
+- [ ] Existing ResourceClaim expansion behavior is unchanged.
+- [ ] Existing configurations remain compatible.
+- [ ] Unit and integration tests pass.
+- [ ] Documentation includes working discovery examples.
+- [ ] No additional controller or CRD is introduced.
+
+**[AMENDED]** "Heterogeneous classes do not publish false uniform guarantees" is achievable as stated: both device counts and capacity are now intersected at the source for every aggregate type (see FR-5). It does not require a weakened implementation or an uncertainty field in the schema.
+
+"Existing ResourceClaim expansion behavior is unchanged" needs one qualification: the capacity intersection fix *did* change the capacity values in aggregate DeviceClasses' `Spec.Config`, which claim expansion consumes. That change is a bug fix landed separately from this feature (aggregates previously advertised a nondeterministic, sometimes-unsatisfiable capacity); this feature itself introduces no further change to expansion.
 
 ---
 
 ## 12. Instructions for Claude Code / implementing agent
 
-**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. The grouping driver/count intersection is implemented on `fix/grouping-aggregate-intersection`; verify that fix is present on the implementation base. **Do not assume FR-5 is fully satisfied:** implement the capacity-map equality check and summary omission policy above, plus the annotation-budget check, before publishing aggregate summaries.
+**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. Both halves of that investigation are now done and acted on: the count intersection (PR #14) and the capacity intersection (committed alongside this spec). Verify both are present on your implementation base before assuming FR-5 is satisfied — if either is missing, you will reproduce the exact problems documented at the top of this file. The one item still genuinely open is the annotation budget (readiness blocker 2); settle its placement before publishing summaries.
 
 Everything else in the original §12 (inspect first, implement, validate with `make test`/`make lint`/`make build`, report unavailable tests rather than claiming they passed, deliver the standard summary) is unchanged.
 
@@ -428,4 +749,18 @@ Everything else in the original §12 (inspect first, implement, validate with `m
 
 ## 13. Future Extensions
 
-*(unchanged)*
+This capability summary becomes the foundation for a richer hardware offering catalog.
+
+Possible future features include:
+
+- Structured filtering by verified GPU, CPU, memory or networking capabilities.
+- Cluster-wide discovery of hardware offerings.
+- Hardware-offering comparison.
+- Optional available-capacity reporting.
+- Recommendations based on workload requirements.
+- Integration with KubeVirt DeviceProvider offerings.
+- Integration with other Kubernetes workload operators and platforms.
+
+These enhancements must consume the generated capability summary rather than creating another source of hardware configuration.
+
+**Long-term architectural principle: The administrator defines hardware composition once; TC derives the technical capabilities; users discover and select the level of abstraction appropriate to their needs.**
