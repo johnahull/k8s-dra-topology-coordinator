@@ -3,7 +3,7 @@
 **Project:** `rh-ecosystem-edge/k8s-dra-topology-coordinator`
 **Feature:** Derived Hardware Capability Summaries
 **Status:** Proposed — review amendments recorded; one open item remains (annotation budget, blocker 2 below)
-**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main`); **and** both aggregate-intersection fixes — the count intersection (PR #14, https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged) and the capacity intersection (committed alongside this spec, see below). This feature cannot be safely implemented without both.
+**Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main`); **and** both aggregate-intersection fixes — count and capacity — which ship together in PR #14 (https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged). This feature cannot be safely implemented without both.
 **Initial scope:** Kubernetes DRA DeviceClasses
 **Priority:** High
 
@@ -42,7 +42,7 @@ Two consequences, both real and both predating this feature:
 - **Nondeterminism.** The aggregate's `Spec.Config` bytes changed between reconciles, so `publishDeviceClass`'s no-op short-circuit never fired for that class and it issued an Update every reconcile — defeating the idempotency work in PR #12.
 - **Incorrectness.** Advertising the larger capacity means claims expanded against the aggregate request more than the smaller partition can supply, and fail to schedule there.
 
-**Fix (committed alongside this spec):** capacity now reduces to the per-key minimum over the keys shared by every alternative, via `mergeMinCapacity`. Keys absent from any alternative are dropped rather than advertised as guaranteed. Quantities are compared with `resource.Quantity.Cmp`; values that fail to parse fall back to a stable lexical choice, arbitrary but not iteration-order-dependent.
+**Fix (PR #14, same branch as the count fix):** capacity now reduces to the per-key minimum over the keys shared by every alternative, via `mergeMinCapacity`. Keys absent from any alternative are dropped rather than advertised as guaranteed. Quantities are compared with `resource.Quantity.Cmp`; values that fail to parse fall back to a stable lexical choice, arbitrary but not iteration-order-dependent.
 
 **Consequence for this spec — this supersedes the earlier "omit the summary when capacities differ" policy.** That policy was the right call against the code as it stood, where the config could not be trusted. Now that both counts and capacity are intersected at the source, an aggregate's `PartitionConfig` *is* a guarantee in both dimensions, and the summary can reflect it faithfully with no special handling:
 
@@ -741,7 +741,7 @@ This feature is metadata generation and discovery only.
 
 ## 12. Instructions for Claude Code / implementing agent
 
-**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. Both halves of that investigation are now done and acted on: the count intersection (PR #14) and the capacity intersection (committed alongside this spec). Verify both are present on your implementation base before assuming FR-5 is satisfied — if either is missing, you will reproduce the exact problems documented at the top of this file. The one item still genuinely open is the annotation budget (readiness blocker 2); settle its placement before publishing summaries.
+**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. Both halves of that investigation are now done and acted on: the count intersection and the capacity intersection, both in PR #14. Verify both are present on your implementation base before assuming FR-5 is satisfied — if either is missing, you will reproduce the exact problems documented at the top of this file. The one item still genuinely open is the annotation budget (readiness blocker 2); settle its placement before publishing summaries.
 
 Everything else in the original §12 (inspect first, implement, validate with `make test`/`make lint`/`make build`, report unavailable tests rather than claiming they passed, deliver the standard summary) is unchanged.
 
