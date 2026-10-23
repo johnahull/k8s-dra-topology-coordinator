@@ -1063,3 +1063,236 @@ func TestSanitizeDNSLabel(t *testing.T) {
 		})
 	}
 }
+
+// multiDeviceGroupingInstance returns a grouping instance with three device
+// classes, so buildGroupingConfig's map-ranging over DeviceCounts has enough
+// entries to expose ordering nondeterminism if sortPartitionConfig is absent
+// or broken.
+func multiDeviceGroupingInstance(railIndex int) GroupingInstance {
+	return GroupingInstance{
+		Name:         fmt.Sprintf("node-1-gpu-nic-pair-pcieroot-%d", railIndex),
+		NodeName:     "node-1",
+		GroupingName: "gpu-nic-pair",
+		Alignment:    "pcieRoot",
+		PCIeRoots:    []string{fmt.Sprintf("pci0000:%02d", railIndex)},
+		DeviceCounts: map[string]int{
+			"gpu.nvidia.com":    1,
+			"rdma.mellanox.com": 1,
+			"nvme.example.com":  1,
+		},
+		RailIndex: railIndex,
+	}
+}
+
+func TestDeviceClassManager_GroupingConfigIsDeterministic(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	inst := multiDeviceGroupingInstance(0)
+
+	var firstRaw []byte
+	for i := 0; i < 20; i++ {
+		config := manager.buildGroupingConfig(inst)
+		raw, err := json.Marshal(config)
+		require.NoError(t, err)
+		if i == 0 {
+			firstRaw = raw
+			continue
+		}
+		assert.Equal(t, string(firstRaw), string(raw),
+			"buildGroupingConfig must marshal identically across calls, iteration %d", i)
+	}
+}
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIsDeterministic(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Two rails for the same grouping name, so the aggregate's representative
+	// is picked from a map with more than one entry.
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{
+			multiDeviceGroupingInstance(0),
+			multiDeviceGroupingInstance(1),
+		}},
+	}
+
+	for i := 0; i < 10; i++ {
+		err := manager.SyncGroupingDeviceClasses(context.Background(), results)
+		require.NoError(t, err)
+	}
+
+	dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "pcieRoot", dc.Labels[CoordinatorDriverName+"/alignment"])
+}
+
+func TestDeviceClassManager_PublishDeviceClass_PreservesForeignMetadata(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{multiDeviceGroupingInstance(0)}},
+	}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	// Simulate a foreign actor (kubectl, Helm, ArgoCD) annotating/labeling the
+	// managed DeviceClass.
+	dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	if dc.Annotations == nil {
+		dc.Annotations = map[string]string{}
+	}
+	dc.Annotations["kubectl.kubernetes.io/last-applied-configuration"] = "{}"
+	if dc.Labels == nil {
+		dc.Labels = map[string]string{}
+	}
+	dc.Labels["app.kubernetes.io/managed-by"] = "Helm"
+	_, err = client.ResourceV1().DeviceClasses().Update(context.Background(), dc, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	// Reconcile again with no config change.
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	dc, err = client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "{}", dc.Annotations["kubectl.kubernetes.io/last-applied-configuration"],
+		"foreign annotation must survive reconciliation")
+	assert.Equal(t, "Helm", dc.Labels["app.kubernetes.io/managed-by"],
+		"foreign label must survive reconciliation")
+	assert.Equal(t, "true", dc.Labels[CoordinatorDriverName+"/managed"], "TC-owned label must still be set")
+}
+
+func TestDeviceClassManager_PublishDeviceClass_NoOpWhenUnchanged(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{multiDeviceGroupingInstance(0)}},
+	}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	before, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	after, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, before.ResourceVersion, after.ResourceVersion,
+		"an unchanged reconcile must not issue an Update (ResourceVersion must not advance)")
+}
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_DeletionCleansUpOrphans(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{multiDeviceGroupingInstance(0)}},
+	}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, classes.Items, "grouping DeviceClasses should exist after first sync")
+
+	// Simulates the last grouping ConfigMap being deleted: no results at all.
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), nil))
+
+	classes, err = client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, classes.Items, "orphaned grouping DeviceClasses must be cleaned up when groupings disappear")
+}
+
+func TestDeviceClassManager_SyncDeviceClasses_PreservesForeignMetadata(t *testing.T) {
+	// Covers the partition path (not just grouping), since publishDeviceClass
+	// is shared by both SyncDeviceClasses and SyncGroupingDeviceClasses.
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	results := []PartitionResult{
+		{
+			NodeName: "node-1",
+			Profile:  "test",
+			Partitions: []PartitionDevice{
+				{Name: "p-full", Type: PartitionFull, Profile: "test", DeviceCounts: map[string]int{"gpu.nvidia.com": 8}},
+			},
+		},
+	}
+	require.NoError(t, manager.SyncDeviceClasses(context.Background(), results))
+
+	dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "full", metav1.GetOptions{})
+	require.NoError(t, err)
+	if dc.Annotations == nil {
+		dc.Annotations = map[string]string{}
+	}
+	dc.Annotations["example.com/owner"] = "team-infra"
+	_, err = client.ResourceV1().DeviceClasses().Update(context.Background(), dc, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, manager.SyncDeviceClasses(context.Background(), results))
+
+	dc, err = client.ResourceV1().DeviceClasses().Get(context.Background(), "full", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "team-infra", dc.Annotations["example.com/owner"],
+		"foreign annotation on a partition-path DeviceClass must survive reconciliation")
+}
+
+// TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic
+// covers config.Alignments ordering specifically. GetMatchConstraintRules
+// ranges over TopologyRuleStore's internal map, so with 2+ ConstraintMatch
+// rules configured, the order buildPartitionConfig appends Alignments in is
+// random across calls. sortPartitionConfig must sort the Alignments slice
+// itself (not just each Alignment's Requests) or the marshaled config keeps
+// changing every reconcile, defeating publishDeviceClass's no-op check.
+func TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	require.NoError(t, rules.LoadFromConfigMap(makeTopologyRuleConfigMap("pcie-root-rule", "default", map[string]string{
+		"attribute":  AttrPCIeRoot,
+		"type":       "string",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	})))
+	require.NoError(t, rules.LoadFromConfigMap(makeTopologyRuleConfigMap("socket-rule", "default", map[string]string{
+		"attribute":  AttrSocket,
+		"type":       "int",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	})))
+
+	pcieRoot := "pci0000:00"
+	var socket int64
+	representative := PartitionDevice{
+		DeviceCounts: map[string]int{
+			"gpu.nvidia.com":    1,
+			"rdma.mellanox.com": 1,
+		},
+		Devices: []TopologyDevice{
+			{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot, Socket: &socket},
+			{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot, Socket: &socket},
+		},
+	}
+
+	var firstRaw []byte
+	for i := 0; i < 30; i++ {
+		config, _ := manager.buildPartitionConfig(PartitionFull, representative)
+		require.Len(t, config.Alignments, 2, "both match-constraint rules should produce an alignment")
+		raw, err := json.Marshal(config)
+		require.NoError(t, err)
+		if i == 0 {
+			firstRaw = raw
+			continue
+		}
+		assert.Equal(t, string(firstRaw), string(raw),
+			"buildPartitionConfig must marshal identically across calls with multiple match-constraint rules, iteration %d", i)
+	}
+}

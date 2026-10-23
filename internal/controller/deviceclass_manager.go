@@ -5,15 +5,18 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	stdliberrors "errors"
 	"fmt"
 	"sort"
 	"strings"
 
 	resourcev1 "k8s.io/api/resource/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	klog "k8s.io/klog/v2"
 )
 
@@ -70,6 +73,35 @@ type AlignmentConfig struct {
 	Enforcement EnforcementMode `json:"enforcement"`
 }
 
+// sortPartitionConfig normalizes a PartitionConfig's ordering so that the
+// marshaled JSON (and therefore the opaque DeviceClass config) is stable
+// across reconciles. SubResources and Alignments[].Requests are built by
+// ranging maps (DeviceCounts), which iterate in random order in Go; without
+// this, publishDeviceClass would see a spurious diff on every reconcile and
+// its no-op short-circuit would never fire.
+func sortPartitionConfig(config *PartitionConfig) {
+	sort.Slice(config.SubResources, func(i, j int) bool {
+		a, b := config.SubResources[i], config.SubResources[j]
+		if a.DeviceClass != b.DeviceClass {
+			return a.DeviceClass < b.DeviceClass
+		}
+		return a.Count < b.Count
+	})
+	for i := range config.Alignments {
+		sort.Strings(config.Alignments[i].Requests)
+	}
+	// Alignments themselves are appended in topology-rule order, which comes
+	// from TopologyRuleStore ranging over a map (random order). Sort them too
+	// so the marshaled config is stable when 2+ match-constraint rules exist.
+	sort.Slice(config.Alignments, func(i, j int) bool {
+		a, b := config.Alignments[i], config.Alignments[j]
+		if a.Attribute != b.Attribute {
+			return a.Attribute < b.Attribute
+		}
+		return strings.Join(a.Requests, ",") < strings.Join(b.Requests, ",")
+	})
+}
+
 // profilePartition tracks a unique partition instance for DeviceClass generation.
 type profilePartition struct {
 	profile        string
@@ -108,6 +140,11 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 // SyncDeviceClasses creates or updates DeviceClass objects for each partition type
 // discovered across all nodes.
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
+	// Errors are accumulated rather than returned immediately so that one
+	// unpublishable DeviceClass does not block every other DeviceClass from
+	// reconciling (same rationale as SyncGroupingDeviceClasses).
+	var publishErrs []error
+
 	// Collect all unique partition types and their profiles.
 	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
 	seen := make(map[string]*profilePartition)
@@ -174,7 +211,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			}
 		}
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -299,7 +336,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, CouplingNone, pp.count)
 		dc.Name = string(pp.partType)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -339,7 +376,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		dc.Name = tierName
 		dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -360,7 +397,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	}
 
 	klog.Infof("Synced %d DeviceClasses", len(seen))
-	return nil
+	return stdliberrors.Join(publishErrs...)
 }
 
 // computeTierName returns the human-readable tier name (eighth, quarter, half, etc.)
@@ -732,6 +769,7 @@ func (m *DeviceClassManager) buildPartitionConfig(_ PartitionType, representativ
 		}
 	}
 
+	sortPartitionConfig(&config)
 	return config, coupling
 }
 
@@ -860,6 +898,7 @@ func (m *DeviceClassManager) buildPartitionAggregateConfig(representative Partit
 		}
 	}
 
+	sortPartitionConfig(&config)
 	return config, coupling
 }
 
@@ -1009,12 +1048,15 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		}
 	}
 
-	// Emit per-instance DeviceClasses with rail index in name
+	// Emit per-instance DeviceClasses with rail index in name. Errors are
+	// accumulated rather than returned immediately so that one unpublishable
+	// grouping does not block every other grouping from reconciling.
+	var publishErrs []error
 	for key, entry := range seen {
 		dc := m.buildGroupingDeviceClass(key, entry.representative, entry.config, entry.count)
 		dc.Name = fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -1024,15 +1066,23 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	aggregates := make(map[string]*groupingEntry)
 	for _, entry := range seen {
 		name := entry.representative.GroupingName
-		if _, ok := aggregates[name]; !ok {
+		existing, ok := aggregates[name]
+		if !ok {
 			aggConfig := m.buildGroupingAggregateConfig(entry.representative)
 			aggregates[name] = &groupingEntry{
 				representative: entry.representative,
 				config:         aggConfig,
 				count:          entry.count,
 			}
-		} else {
-			aggregates[name].count += entry.count
+			continue
+		}
+		existing.count += entry.count
+		// Pick the representative deterministically (lowest RailIndex) since
+		// `seen` is a map and iteration order is random; without this the
+		// aggregate's labels and config would vary between reconciles.
+		if entry.representative.RailIndex < existing.representative.RailIndex {
+			existing.representative = entry.representative
+			existing.config = m.buildGroupingAggregateConfig(entry.representative)
 		}
 	}
 	for _, entry := range aggregates {
@@ -1041,10 +1091,13 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		dc.Name = sanitizeForName(entry.representative.GroupingName)
 		delete(dc.Labels, CoordinatorDriverName+"/numa")
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
+	// activeNames includes every entry regardless of publish success/failure,
+	// so a transient publish error does not cause cleanup to delete a
+	// DeviceClass that a prior successful reconcile already created.
 	activeNames := make(map[string]bool, len(seen)+len(aggregates))
 	for _, entry := range seen {
 		name := fmt.Sprintf("%s-rail%d", sanitizeForName(entry.representative.GroupingName), entry.representative.RailIndex)
@@ -1059,7 +1112,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	}
 
 	klog.Infof("Synced %d grouping DeviceClasses", len(seen))
-	return nil
+	return stdliberrors.Join(publishErrs...)
 }
 
 // buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.
@@ -1150,6 +1203,7 @@ func (m *DeviceClassManager) buildGroupingConfigInternal(inst GroupingInstance, 
 		})
 	}
 
+	sortPartitionConfig(&config)
 	return config
 }
 
@@ -1331,7 +1385,55 @@ func detectPartitionModeAttr(dev TopologyDevice) (attrName string, mode string) 
 	return "", ""
 }
 
-// publishDeviceClass creates or updates a DeviceClass.
+// tcOwnedLabelPrefix is the key prefix publishDeviceClass uses to decide
+// which labels/annotations it owns on a DeviceClass. Always derived from the
+// CoordinatorDriverName const (not m.driverName, which is configurable and
+// only appears in CEL expressions and Opaque.Driver, never in a metadata key).
+const tcOwnedLabelPrefix = CoordinatorDriverName + "/"
+
+// stringMapEqual compares two string maps by content, treating nil and empty
+// maps as equal (unlike reflect/apiequality.Semantic.DeepEqual, which treats
+// them as different). Without this, a foreign actor setting an empty
+// labels/annotations map (e.g. `{}`) would make publishDeviceClass see a
+// perpetual diff against mergeTCOwnedMetadata's nil-when-empty result.
+func stringMapEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeTCOwnedMetadata returns a copy of existing merged with built's
+// TC-owned keys: every TC-owned key present on built is set (added or
+// overwritten), and every TC-owned key present on existing but absent from
+// built is deleted. Keys not owned by TC (no nodepartition.dra.k8s.io/
+// prefix) are left untouched, so labels/annotations set by kubectl, Helm,
+// ArgoCD, etc. survive reconciliation.
+func mergeTCOwnedMetadata(existing, built map[string]string) map[string]string {
+	merged := make(map[string]string, len(existing)+len(built))
+	for k, v := range existing {
+		if !strings.HasPrefix(k, tcOwnedLabelPrefix) {
+			merged[k] = v
+		}
+	}
+	for k, v := range built {
+		merged[k] = v
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+// publishDeviceClass creates or updates a DeviceClass. Updates are
+// merge-preserving (foreign labels/annotations are kept, only TC-owned keys
+// are added/overwritten/removed) and skipped entirely when nothing TC owns
+// has changed, so a steady-state cluster produces no DeviceClass API calls.
 func (m *DeviceClassManager) publishDeviceClass(ctx context.Context, dc *resourcev1.DeviceClass) error {
 	existing, err := m.client.ResourceV1().DeviceClasses().Get(ctx, dc.Name, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
@@ -1346,9 +1448,29 @@ func (m *DeviceClassManager) publishDeviceClass(ctx context.Context, dc *resourc
 		return fmt.Errorf("failed to get DeviceClass %s: %w", dc.Name, err)
 	}
 
-	// Update existing
-	dc.ResourceVersion = existing.ResourceVersion
-	_, err = m.client.ResourceV1().DeviceClasses().Update(ctx, dc, metav1.UpdateOptions{})
+	merged := existing.DeepCopy()
+	merged.Spec = dc.Spec
+	merged.Labels = mergeTCOwnedMetadata(existing.Labels, dc.Labels)
+	merged.Annotations = mergeTCOwnedMetadata(existing.Annotations, dc.Annotations)
+
+	if apiequality.Semantic.DeepEqual(merged.Spec, existing.Spec) &&
+		stringMapEqual(merged.Labels, existing.Labels) &&
+		stringMapEqual(merged.Annotations, existing.Annotations) {
+		return nil
+	}
+
+	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest, getErr := m.client.ResourceV1().DeviceClasses().Get(ctx, dc.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		toUpdate := latest.DeepCopy()
+		toUpdate.Spec = dc.Spec
+		toUpdate.Labels = mergeTCOwnedMetadata(latest.Labels, dc.Labels)
+		toUpdate.Annotations = mergeTCOwnedMetadata(latest.Annotations, dc.Annotations)
+		_, updateErr := m.client.ResourceV1().DeviceClasses().Update(ctx, toUpdate, metav1.UpdateOptions{})
+		return updateErr
+	})
 	if err != nil {
 		return fmt.Errorf("failed to update DeviceClass %s: %w", dc.Name, err)
 	}
