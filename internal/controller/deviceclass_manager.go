@@ -13,6 +13,7 @@ import (
 	resourcev1 "k8s.io/api/resource/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -100,6 +101,66 @@ func sortPartitionConfig(config *PartitionConfig) {
 		}
 		return strings.Join(a.Requests, ",") < strings.Join(b.Requests, ",")
 	})
+}
+
+// mergeMinCapacity reduces two capacity maps to the per-key minimum over the
+// keys they share, which is the only value guaranteed satisfiable on every
+// alternative in an aggregate.
+//
+// Aggregates intersect device counts (a driver must be present on every
+// instance, at the minimum count); capacity needs the same treatment for the
+// same reason. PCIe-root partitions in particular can carry genuinely
+// different capacities for the same driver, because the builder divides a
+// shared device's capacity by the number of PCIe roots on its NUMA node
+// (partition_builder.go, divideQuantity) - a node whose NUMA nodes have
+// different root counts yields partitions with different per-partition
+// capacity under one aggregate key.
+//
+// Taking the minimum is both deterministic (the previous last-writer-wins
+// assignment varied with map iteration order, so the published config, and
+// therefore publishDeviceClass's no-op check, changed between reconciles)
+// and safe (advertising the larger value produces claims unschedulable on
+// the smaller partition).
+//
+// A key absent from either side is dropped: a capacity that is not present
+// on every alternative cannot be guaranteed by the aggregate. Values that
+// fail to parse as Kubernetes quantities fall back to the lexically smaller
+// string, which is arbitrary but stable - preferred over propagating
+// iteration-order nondeterminism into the published config.
+func mergeMinCapacity(existing, incoming map[string]string) map[string]string {
+	if existing == nil || incoming == nil {
+		return nil
+	}
+	merged := make(map[string]string, len(existing))
+	for name, have := range existing {
+		next, ok := incoming[name]
+		if !ok {
+			continue // not guaranteed across all alternatives
+		}
+		merged[name] = minQuantityString(have, next)
+	}
+	if len(merged) == 0 {
+		return nil
+	}
+	return merged
+}
+
+// minQuantityString returns the smaller of two Kubernetes quantity strings,
+// falling back to a stable lexical comparison when either fails to parse.
+func minQuantityString(a, b string) string {
+	qa, errA := resource.ParseQuantity(a)
+	qb, errB := resource.ParseQuantity(b)
+	if errA != nil || errB != nil {
+		klog.V(4).Infof("Capacity value not parseable as a quantity (%q, %q); falling back to lexical comparison", a, b)
+		if b < a {
+			return b
+		}
+		return a
+	}
+	if qb.Cmp(qa) < 0 {
+		return b
+	}
+	return a
 }
 
 // profilePartition tracks a unique partition instance for DeviceClass generation.
@@ -249,10 +310,10 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 				if prev, has := existing.minCounts[driver]; !has || count < prev {
 					existing.minCounts[driver] = count
 				}
-				if pp.representative.DeviceCapacity != nil {
-					if cap, ok := pp.representative.DeviceCapacity[driver]; ok {
-						existing.minCap[driver] = cap
-					}
+				if merged := mergeMinCapacity(existing.minCap[driver], pp.representative.DeviceCapacity[driver]); merged != nil {
+					existing.minCap[driver] = merged
+				} else {
+					delete(existing.minCap, driver)
 				}
 			}
 			existing.devices = append(existing.devices, pp.representative.Devices...)
@@ -1092,8 +1153,10 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 				if prev, has := existing.minCounts[driver]; !has || count < prev {
 					existing.minCounts[driver] = count
 				}
-				if cap, ok := entry.representative.DeviceCapacity[driver]; ok {
-					existing.minCap[driver] = cap
+				if merged := mergeMinCapacity(existing.minCap[driver], entry.representative.DeviceCapacity[driver]); merged != nil {
+					existing.minCap[driver] = merged
+				} else {
+					delete(existing.minCap, driver)
 				}
 			}
 			existing.devices = append(existing.devices, entry.representative.Devices...)
