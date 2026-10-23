@@ -1396,3 +1396,50 @@ func TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic(
 			"buildPartitionConfig must marshal identically across calls with multiple match-constraint rules, iteration %d", i)
 	}
 }
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	// Rail 0 has gpu+nic+nvme; rail 1 has only gpu, and with a lower count.
+	// The aggregate must publish only what's guaranteed on every rail: gpu
+	// at the minimum count (1), and nic/nvme excluded entirely since they're
+	// not present on rail 1. Without intersection, the aggregate would
+	// arbitrarily publish whichever rail's full config happened to "win" by
+	// lowest RailIndex, misrepresenting rail 1's actual (lesser) capability.
+	rail0 := multiDeviceGroupingInstance(0)
+	rail1 := GroupingInstance{
+		Name:         "node-1-gpu-nic-pair-pcieroot-1",
+		NodeName:     "node-1",
+		GroupingName: "gpu-nic-pair",
+		Alignment:    "pcieRoot",
+		PCIeRoots:    []string{"pci0000:01"},
+		DeviceCounts: map[string]int{
+			"gpu.nvidia.com": 2, // higher count than rail0's 1 -> min must win
+		},
+		RailIndex: 1,
+	}
+
+	results := []GroupingResult{
+		{NodeName: "node-1", Instances: []GroupingInstance{rail0, rail1}},
+	}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	dc, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	var config PartitionConfig
+	require.NoError(t, json.Unmarshal(dc.Spec.Config[0].Opaque.Parameters.Raw, &config))
+
+	classes := make(map[string]SubResourceConfig, len(config.SubResources))
+	for _, sr := range config.SubResources {
+		classes[sr.DeviceClass] = sr
+	}
+
+	require.Contains(t, classes, "gpu.nvidia.com", "gpu is present on every rail, must survive intersection")
+	assert.Equal(t, 1, classes["gpu.nvidia.com"].Count, "aggregate count must be the minimum across rails, not rail1's higher count")
+
+	assert.NotContains(t, classes, "rdma.mellanox.com", "nic is absent from rail1, must not appear in the aggregate")
+	assert.NotContains(t, classes, "nvme.example.com", "nvme is absent from rail1, must not appear in the aggregate")
+}

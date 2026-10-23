@@ -1055,28 +1055,99 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	// Emit aggregate DeviceClasses (one per grouping name, no NUMA selector).
 	// Lets users request "any gpu-nic-pair" without specifying a NUMA node;
 	// the scheduler finds a satisfiable placement automatically.
+	//
 	// All instances for a grouping name share one merged source, so intent is
 	// identical; combining sources under one name later would invalidate this.
-	aggregates := make(map[string]*groupingEntry)
+	//
+	// Use intersection of device counts, mirroring the partition-aggregate
+	// path above: only include drivers present on ALL instances of this
+	// grouping name, so the aggregate is schedulable (and truthfully
+	// describable) regardless of which rail/node it resolves to. A grouping
+	// can be asymmetric across rails (e.g. a GPU+NIC pair present on rail 0
+	// but only a bare GPU on rail 1); publishing one arbitrary instance's
+	// config as "the" aggregate would misrepresent rails that don't have it.
+	type groupingAggregateState struct {
+		groupingName string
+		alignment    string
+		intent       IntentMetadata // identical across instances, per the note above
+		driverSeen   map[string]int // driver -> number of instances that have it
+		minCounts    map[string]int
+		minCap       map[string]map[string]string
+		devices      []TopologyDevice
+		minRailIndex int
+		total        int // total instances of this grouping name
+		count        int // sum of entry.count
+	}
+	aggStates := make(map[string]*groupingAggregateState)
 	for _, entry := range seen {
 		name := entry.representative.GroupingName
-		existing, ok := aggregates[name]
-		if !ok {
-			aggConfig := m.buildGroupingAggregateConfig(entry.representative)
-			aggregates[name] = &groupingEntry{
-				representative: entry.representative,
-				config:         aggConfig,
-				count:          entry.count,
+		if existing, ok := aggStates[name]; ok {
+			existing.count += entry.count
+			existing.total++
+			if entry.representative.RailIndex < existing.minRailIndex {
+				existing.minRailIndex = entry.representative.RailIndex
 			}
+			for driver, count := range entry.representative.DeviceCounts {
+				existing.driverSeen[driver]++
+				if prev, has := existing.minCounts[driver]; !has || count < prev {
+					existing.minCounts[driver] = count
+				}
+				if cap, ok := entry.representative.DeviceCapacity[driver]; ok {
+					existing.minCap[driver] = cap
+				}
+			}
+			existing.devices = append(existing.devices, entry.representative.Devices...)
 			continue
 		}
-		existing.count += entry.count
-		// Pick the representative deterministically (lowest RailIndex) since
-		// `seen` is a map and iteration order is random; without this the
-		// aggregate's labels and config would vary between reconciles.
-		if entry.representative.RailIndex < existing.representative.RailIndex {
-			existing.representative = entry.representative
-			existing.config = m.buildGroupingAggregateConfig(entry.representative)
+		driverSeen := make(map[string]int)
+		minCounts := make(map[string]int)
+		for driver, count := range entry.representative.DeviceCounts {
+			driverSeen[driver] = 1
+			minCounts[driver] = count
+		}
+		minCap := make(map[string]map[string]string)
+		for driver, cap := range entry.representative.DeviceCapacity {
+			minCap[driver] = cap
+		}
+		aggStates[name] = &groupingAggregateState{
+			groupingName: name,
+			alignment:    entry.representative.Alignment,
+			intent:       entry.representative.Intent,
+			driverSeen:   driverSeen,
+			minCounts:    minCounts,
+			minCap:       minCap,
+			devices:      append([]TopologyDevice{}, entry.representative.Devices...),
+			minRailIndex: entry.representative.RailIndex,
+			total:        1,
+			count:        entry.count,
+		}
+	}
+	aggregates := make(map[string]*groupingEntry)
+	for name, state := range aggStates {
+		intersectedCounts := make(map[string]int)
+		intersectedCap := make(map[string]map[string]string)
+		for driver, seenCount := range state.driverSeen {
+			if seenCount != state.total {
+				continue // not present on every instance of this grouping name
+			}
+			intersectedCounts[driver] = state.minCounts[driver]
+			if cap, ok := state.minCap[driver]; ok {
+				intersectedCap[driver] = cap
+			}
+		}
+		mergedRep := GroupingInstance{
+			GroupingName:   state.groupingName,
+			Alignment:      state.alignment,
+			Intent:         state.intent,
+			DeviceCounts:   intersectedCounts,
+			DeviceCapacity: intersectedCap,
+			Devices:        state.devices,
+			RailIndex:      state.minRailIndex,
+		}
+		aggregates[name] = &groupingEntry{
+			representative: mergedRep,
+			config:         m.buildGroupingAggregateConfig(mergedRep),
+			count:          state.count,
 		}
 	}
 	for _, entry := range aggregates {
