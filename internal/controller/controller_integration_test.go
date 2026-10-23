@@ -110,12 +110,12 @@ func waitForDeviceClasses(t *testing.T, ctx context.Context, client kubernetes.I
 	}
 }
 
-func waitForNamedDeviceClass(t *testing.T, ctx context.Context, client kubernetes.Interface, name string, matches func(*resourcev1.DeviceClass) bool) *resourcev1.DeviceClass {
+func waitForGPUInferenceDeviceClass(t *testing.T, ctx context.Context, client kubernetes.Interface, matches func(*resourcev1.DeviceClass) bool) *resourcev1.DeviceClass {
 	t.Helper()
 
 	var result *resourcev1.DeviceClass
 	require.Eventually(t, func() bool {
-		deviceClass, err := client.ResourceV1().DeviceClasses().Get(ctx, name, metav1.GetOptions{})
+		deviceClass, err := client.ResourceV1().DeviceClasses().Get(ctx, "gpu-inference", metav1.GetOptions{})
 		if err != nil || !matches(deviceClass) {
 			return false
 		}
@@ -178,7 +178,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	descriptionKey := controller.CoordinatorDriverName + "/description"
 	categoriesKey := controller.CoordinatorDriverName + "/categories"
 	workloadTypesKey := controller.CoordinatorDriverName + "/workload-types"
-	deviceClass := waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+	deviceClass := waitForGPUInferenceDeviceClass(t, ctx, client, func(dc *resourcev1.DeviceClass) bool {
 		return dc.Labels[controller.CoordinatorDriverName+"/managed"] == "true"
 	})
 	require.Equal(t, "workload", deviceClass.Labels[intentLevelKey])
@@ -190,7 +190,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	originalConfig := deviceClass.Spec.Config
 	deviceClass.Labels["foreign.example.com/team"] = "platform"
 	deviceClass.Annotations["foreign.example.com/owner"] = "controller"
-	deviceClass, err = client.ResourceV1().DeviceClasses().Update(ctx, deviceClass, metav1.UpdateOptions{})
+	_, err = client.ResourceV1().DeviceClasses().Update(ctx, deviceClass, metav1.UpdateOptions{})
 	require.NoError(t, err)
 
 	grouping, err = client.CoreV1().ConfigMaps("default").Get(ctx, grouping.Name, metav1.GetOptions{})
@@ -198,7 +198,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	grouping.Data["displayName"] = "AI training accelerator"
 	_, err = client.CoreV1().ConfigMaps("default").Update(ctx, grouping, metav1.UpdateOptions{})
 	require.NoError(t, err)
-	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+	deviceClass = waitForGPUInferenceDeviceClass(t, ctx, client, func(dc *resourcev1.DeviceClass) bool {
 		return dc.Annotations[displayNameKey] == "AI training accelerator"
 	})
 	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
@@ -211,7 +211,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	delete(grouping.Data, "visibility")
 	_, err = client.CoreV1().ConfigMaps("default").Update(ctx, grouping, metav1.UpdateOptions{})
 	require.NoError(t, err)
-	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+	deviceClass = waitForGPUInferenceDeviceClass(t, ctx, client, func(dc *resourcev1.DeviceClass) bool {
 		_, exists := dc.Annotations[descriptionKey]
 		_, hasVisibility := dc.Labels[visibilityKey]
 		return !exists && !hasVisibility
@@ -225,7 +225,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	cancel = nil
 	require.NoError(t, client.ResourceV1().DeviceClasses().Delete(ctx, "gpu-inference", metav1.DeleteOptions{}))
 	cancel, done = startController()
-	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+	deviceClass = waitForGPUInferenceDeviceClass(t, ctx, client, func(dc *resourcev1.DeviceClass) bool {
 		_, hasDescription := dc.Annotations[descriptionKey]
 		_, hasVisibility := dc.Labels[visibilityKey]
 		return dc.Labels[intentLevelKey] == "workload" && dc.Annotations[displayNameKey] == "AI training accelerator" && !hasDescription && !hasVisibility
