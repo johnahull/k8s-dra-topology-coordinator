@@ -163,6 +163,86 @@ func minQuantityString(a, b string) string {
 	return a
 }
 
+// deviceIntersectionState accumulates per-driver device counts, capacity,
+// and devices across repeated instances sharing an aggregate key (a
+// partition type, or a grouping name), and reduces them to the intersection:
+// a driver survives only if present on every added instance, at the minimum
+// count and minimum capacity across those instances.
+//
+// Shared by SyncDeviceClasses' partition-type aggregate and
+// SyncGroupingDeviceClasses' grouping aggregate, which both need this exact
+// reduction for the same reason: an aggregate DeviceClass must describe only
+// what's guaranteed across every alternative it could resolve to, never one
+// arbitrary alternative's full capability (see the comments at each call
+// site for why that matters).
+type deviceIntersectionState struct {
+	driverSeen map[string]int // driver -> number of instances that have it
+	minCounts  map[string]int
+	minCap     map[string]map[string]string
+	devices    []TopologyDevice
+	total      int // number of instances added
+}
+
+func newDeviceIntersectionState() *deviceIntersectionState {
+	return &deviceIntersectionState{
+		driverSeen: make(map[string]int),
+		minCounts:  make(map[string]int),
+		minCap:     make(map[string]map[string]string),
+	}
+}
+
+// add folds one instance's device counts, capacity, and devices into the
+// accumulator.
+func (s *deviceIntersectionState) add(counts map[string]int, capacity map[string]map[string]string, devices []TopologyDevice) {
+	s.total++
+	for driver, count := range counts {
+		s.driverSeen[driver]++
+		if prev, has := s.minCounts[driver]; !has || count < prev {
+			s.minCounts[driver] = count
+		}
+		cap, hasCap := capacity[driver]
+		if existing, hasExisting := s.minCap[driver]; hasExisting {
+			if merged := mergeMinCapacity(existing, cap); merged != nil {
+				s.minCap[driver] = merged
+			} else {
+				delete(s.minCap, driver)
+			}
+		} else if hasCap {
+			s.minCap[driver] = cap
+		}
+	}
+	s.devices = append(s.devices, devices...)
+}
+
+// intersect returns the counts and capacity for drivers present on every
+// added instance, at the minimum count/capacity. extra, if non-nil, is
+// consulted for drivers that did not survive the plain intersection, to
+// support carve-outs like the partition path's SLIT-reachability check; it
+// returns the count to use and whether the driver should be included.
+func (s *deviceIntersectionState) intersect(extra func(driver string) (count int, ok bool)) (map[string]int, map[string]map[string]string) {
+	counts := make(map[string]int)
+	cap := make(map[string]map[string]string)
+	for driver, seenCount := range s.driverSeen {
+		if seenCount == s.total {
+			counts[driver] = s.minCounts[driver]
+			if c, ok := s.minCap[driver]; ok {
+				cap[driver] = c
+			}
+			continue
+		}
+		if extra == nil {
+			continue
+		}
+		if count, ok := extra(driver); ok {
+			counts[driver] = count
+			if c, ok := s.minCap[driver]; ok {
+				cap[driver] = c
+			}
+		}
+	}
+	return counts, cap
+}
+
 // profilePartition tracks a unique partition instance for DeviceClass generation.
 type profilePartition struct {
 	profile        string
@@ -285,12 +365,8 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	type aggregateState struct {
 		profile        string
 		partType       PartitionType
-		driverSeen     map[string]int // driver → number of partitions that have it
-		minCounts      map[string]int
-		minCap         map[string]map[string]string
-		devices        []TopologyDevice
+		acc            *deviceIntersectionState
 		partitionNUMAs []int64 // primary NUMA node of each partition
-		total          int     // total partitions of this type
 		count          int     // sum of pp.count
 	}
 	aggStates := make(map[aggregateKey]*aggregateState)
@@ -299,89 +375,47 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			continue
 		}
 		ak := aggregateKey{profile: pp.profile, partType: pp.partType}
-		if existing, ok := aggStates[ak]; ok {
-			existing.count += pp.count
-			existing.total++
-			if len(pp.representative.NUMANodes) > 0 {
-				existing.partitionNUMAs = append(existing.partitionNUMAs, pp.representative.NUMANodes[0])
+		state, ok := aggStates[ak]
+		if !ok {
+			state = &aggregateState{
+				profile:  pp.profile,
+				partType: pp.partType,
+				acc:      newDeviceIntersectionState(),
 			}
-			for driver, count := range pp.representative.DeviceCounts {
-				existing.driverSeen[driver]++
-				if prev, has := existing.minCounts[driver]; !has || count < prev {
-					existing.minCounts[driver] = count
-				}
-				if merged := mergeMinCapacity(existing.minCap[driver], pp.representative.DeviceCapacity[driver]); merged != nil {
-					existing.minCap[driver] = merged
-				} else {
-					delete(existing.minCap, driver)
-				}
-			}
-			existing.devices = append(existing.devices, pp.representative.Devices...)
-		} else {
-			driverSeen := make(map[string]int)
-			minCounts := make(map[string]int)
-			for k, v := range pp.representative.DeviceCounts {
-				driverSeen[k] = 1
-				minCounts[k] = v
-			}
-			minCap := make(map[string]map[string]string)
-			if pp.representative.DeviceCapacity != nil {
-				for k, v := range pp.representative.DeviceCapacity {
-					minCap[k] = v
-				}
-			}
-			var partNUMAs []int64
-			if len(pp.representative.NUMANodes) > 0 {
-				partNUMAs = []int64{pp.representative.NUMANodes[0]}
-			}
-			aggStates[ak] = &aggregateState{
-				profile:        pp.profile,
-				partType:       pp.partType,
-				driverSeen:     driverSeen,
-				minCounts:      minCounts,
-				minCap:         minCap,
-				devices:        append([]TopologyDevice{}, pp.representative.Devices...),
-				partitionNUMAs: partNUMAs,
-				total:          1,
-				count:          pp.count,
-			}
+			aggStates[ak] = state
 		}
+		state.count += pp.count
+		if len(pp.representative.NUMANodes) > 0 {
+			state.partitionNUMAs = append(state.partitionNUMAs, pp.representative.NUMANodes[0])
+		}
+		state.acc.add(pp.representative.DeviceCounts, pp.representative.DeviceCapacity, pp.representative.Devices)
 	}
 	aggregates := make(map[aggregateKey]*profilePartition)
 	for ak, state := range aggStates {
 		// Intersection: keep drivers present on all partitions, or reachable
 		// to all partitions via SLIT-distance NUMANodes lists.
-		intersectedCounts := make(map[string]int)
-		intersectedCap := make(map[string]map[string]string)
-		for driver, seen := range state.driverSeen {
-			if seen == state.total {
-				intersectedCounts[driver] = state.minCounts[driver]
-				if cap, ok := state.minCap[driver]; ok {
-					intersectedCap[driver] = cap
-				}
-			} else if ak.partType == PartitionNUMA && isDriverReachableToAll(driver, state.partitionNUMAs, state.devices) {
-				// SLIT-reachable driver: divide total count by the number of
-				// NUMA nodes sharing access to get the per-partition share.
-				sharingNUMAs := countSharingNUMAs(driver, state.partitionNUMAs, state.devices)
-				count := state.minCounts[driver]
-				if sharingNUMAs > 1 {
-					count = count / sharingNUMAs
-				}
-				if count < 1 {
-					count = 1
-				}
-				intersectedCounts[driver] = count
-				if cap, ok := state.minCap[driver]; ok {
-					intersectedCap[driver] = cap
-				}
+		intersectedCounts, intersectedCap := state.acc.intersect(func(driver string) (int, bool) {
+			if ak.partType != PartitionNUMA || !isDriverReachableToAll(driver, state.partitionNUMAs, state.acc.devices) {
+				return 0, false
 			}
-		}
+			// SLIT-reachable driver: divide total count by the number of
+			// NUMA nodes sharing access to get the per-partition share.
+			sharingNUMAs := countSharingNUMAs(driver, state.partitionNUMAs, state.acc.devices)
+			count := state.acc.minCounts[driver]
+			if sharingNUMAs > 1 {
+				count = count / sharingNUMAs
+			}
+			if count < 1 {
+				count = 1
+			}
+			return count, true
+		})
 		mergedRep := PartitionDevice{
 			Profile:        state.profile,
 			Type:           state.partType,
 			DeviceCounts:   intersectedCounts,
 			DeviceCapacity: intersectedCap,
-			Devices:        state.devices,
+			Devices:        state.acc.devices,
 		}
 		aggConfig, aggCoupling := m.buildPartitionAggregateConfig(mergedRep)
 		aggregates[ak] = &profilePartition{
@@ -1131,80 +1165,40 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		groupingName string
 		alignment    string
 		intent       IntentMetadata // identical across instances, per the note above
-		driverSeen   map[string]int // driver -> number of instances that have it
-		minCounts    map[string]int
-		minCap       map[string]map[string]string
-		devices      []TopologyDevice
+		acc          *deviceIntersectionState
 		minRailIndex int
-		total        int // total instances of this grouping name
 		count        int // sum of entry.count
 	}
 	aggStates := make(map[string]*groupingAggregateState)
 	for _, entry := range seen {
 		name := entry.representative.GroupingName
-		if existing, ok := aggStates[name]; ok {
-			existing.count += entry.count
-			existing.total++
-			if entry.representative.RailIndex < existing.minRailIndex {
-				existing.minRailIndex = entry.representative.RailIndex
+		state, ok := aggStates[name]
+		if !ok {
+			state = &groupingAggregateState{
+				groupingName: name,
+				alignment:    entry.representative.Alignment,
+				intent:       entry.representative.Intent,
+				acc:          newDeviceIntersectionState(),
+				minRailIndex: entry.representative.RailIndex,
 			}
-			for driver, count := range entry.representative.DeviceCounts {
-				existing.driverSeen[driver]++
-				if prev, has := existing.minCounts[driver]; !has || count < prev {
-					existing.minCounts[driver] = count
-				}
-				if merged := mergeMinCapacity(existing.minCap[driver], entry.representative.DeviceCapacity[driver]); merged != nil {
-					existing.minCap[driver] = merged
-				} else {
-					delete(existing.minCap, driver)
-				}
-			}
-			existing.devices = append(existing.devices, entry.representative.Devices...)
-			continue
+			aggStates[name] = state
 		}
-		driverSeen := make(map[string]int)
-		minCounts := make(map[string]int)
-		for driver, count := range entry.representative.DeviceCounts {
-			driverSeen[driver] = 1
-			minCounts[driver] = count
+		state.count += entry.count
+		if entry.representative.RailIndex < state.minRailIndex {
+			state.minRailIndex = entry.representative.RailIndex
 		}
-		minCap := make(map[string]map[string]string)
-		for driver, cap := range entry.representative.DeviceCapacity {
-			minCap[driver] = cap
-		}
-		aggStates[name] = &groupingAggregateState{
-			groupingName: name,
-			alignment:    entry.representative.Alignment,
-			intent:       entry.representative.Intent,
-			driverSeen:   driverSeen,
-			minCounts:    minCounts,
-			minCap:       minCap,
-			devices:      append([]TopologyDevice{}, entry.representative.Devices...),
-			minRailIndex: entry.representative.RailIndex,
-			total:        1,
-			count:        entry.count,
-		}
+		state.acc.add(entry.representative.DeviceCounts, entry.representative.DeviceCapacity, entry.representative.Devices)
 	}
 	aggregates := make(map[string]*groupingEntry)
 	for name, state := range aggStates {
-		intersectedCounts := make(map[string]int)
-		intersectedCap := make(map[string]map[string]string)
-		for driver, seenCount := range state.driverSeen {
-			if seenCount != state.total {
-				continue // not present on every instance of this grouping name
-			}
-			intersectedCounts[driver] = state.minCounts[driver]
-			if cap, ok := state.minCap[driver]; ok {
-				intersectedCap[driver] = cap
-			}
-		}
+		intersectedCounts, intersectedCap := state.acc.intersect(nil)
 		mergedRep := GroupingInstance{
 			GroupingName:   state.groupingName,
 			Alignment:      state.alignment,
 			Intent:         state.intent,
 			DeviceCounts:   intersectedCounts,
 			DeviceCapacity: intersectedCap,
-			Devices:        state.devices,
+			Devices:        state.acc.devices,
 			RailIndex:      state.minRailIndex,
 		}
 		aggregates[name] = &groupingEntry{
