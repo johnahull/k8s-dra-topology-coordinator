@@ -2,7 +2,7 @@
 
 **Project:** `rh-ecosystem-edge/k8s-dra-topology-coordinator`
 **Feature:** Derived Hardware Capability Summaries
-**Status:** Proposed — review amendments recorded; one open item remains (annotation budget, blocker 2 below)
+**Status:** Ready to implement once both prerequisite PRs are merged — all three readiness blockers resolved
 **Prerequisite:** Intent-Based Hardware Offerings metadata enhancement (PR2, #13, not yet merged to `main`); **and** both aggregate-intersection fixes — count and capacity — which ship together in PR #14 (https://github.com/rh-ecosystem-edge/k8s-dra-topology-coordinator/pull/14, not yet merged). This feature cannot be safely implemented without both.
 **Initial scope:** Kubernetes DRA DeviceClasses
 **Priority:** High
@@ -15,11 +15,11 @@ This spec has been through three review passes against the actual code: a manual
 
 ### Readiness blockers
 
-1. ~~Aggregate capacity values are copied from one qualifying instance without comparison.~~ **Resolved in code** — see "Resolved blocker 2" below. Both counts and capacity are now intersected at the source, so an aggregate's `PartitionConfig` is a genuine guarantee and `BuildCapabilitySummary` can trust it without a provenance parameter or an omit-on-divergence policy.
-2. **OPEN.** The 32 KiB summary-pair limit does not ensure the final merged annotation map stays below Kubernetes' 256 KiB combined annotation limit. The check must account for existing foreign and TC-owned annotations at publish time. See amended FR-2 — the requirement is clear but the *placement* is not yet settled, and settling it is a prerequisite for implementation.
+1. ~~Aggregate capacity values are copied from one qualifying instance without comparison.~~ **Resolved in code** — see "Code fix 2" below. Both counts and capacity are now intersected at the source, so an aggregate's `PartitionConfig` is a genuine guarantee and `BuildCapabilitySummary` can trust it without a provenance parameter or an omit-on-divergence policy.
+2. ~~The 32 KiB summary-pair limit does not ensure the final merged annotation map stays below Kubernetes' 256 KiB combined limit.~~ **Resolved by design decision** — see "Annotation budget" below and the amended FR-2. The check lives in `publishDeviceClass`, is feature-agnostic, and drops TC-owned annotations in a documented expendability order.
 3. ~~The `unchanged` placeholder sections and the 22-case test inventory are missing.~~ **Resolved** — every placeholder section has been restored verbatim from the original spec draft (§5, FR-4, FR-6, FR-8, FR-10, FR-11, §9, §10, §11, §13). The one genuine remaining gap is the 22-case unit-test inventory in §8, which the original spec listed only as a count, not as enumerated cases; §8 now enumerates concrete cases in its place.
 
-### Resolved blocker 1: grouping aggregates did not intersect device counts
+### Code fix 1: grouping aggregates did not intersect device counts
 
 The original §6 FR-5 assumed "the final PartitionConfig associated with each generated class" was always a trustworthy, guaranteed-across-every-realization description for aggregate classes. It was not, for one specific aggregate type.
 
@@ -29,7 +29,7 @@ Verified in `internal/controller/deviceclass_manager.go`: `SyncDeviceClasses`'s 
 
 **Fix (PR #14, branch `fix/grouping-aggregate-intersection`):** `SyncGroupingDeviceClasses` now intersects driver presence and counts across instances of a grouping name, retaining the minimum count. The NUMA-SLIT-reachability carve-out was deliberately **not** ported — it's a partition-type-specific optimization tied to NUMA distance semantics with no equivalent in grouping alignment (pcieRoot/numaNode/socket are a matching key here, not a distance model). Regression test: `TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIntersectsAsymmetricRails`.
 
-### Resolved blocker 2: aggregate capacity was nondeterministic and unsafe
+### Code fix 2: aggregate capacity was nondeterministic and unsafe
 
 The count fix above left capacity untouched, and a follow-up review caught that this was not merely incomplete but actively broken — in both aggregate paths, including the partition-type path that predates all of this work.
 
@@ -51,6 +51,30 @@ Two consequences, both real and both predating this feature:
 - Per-instance summaries copy their configured capacity unchanged, as before.
 
 On the specific question of *minimum* versus *exact equality*: minimum is correct and is what the code does. The two dimensions are now consistent — counts already took the minimum, and taking the minimum of a capacity is the same kind of claim ("guaranteed on every alternative"). Exact-equality-or-omit would be strictly more conservative but would discard a true, useful guarantee: if one partition supplies 16 and another 8, "8" is genuinely guaranteed everywhere and is more informative than publishing nothing. This does not conflict with FR-8's caution about quantity normalization — see the amendment at the end of FR-8.
+
+### Annotation budget (resolves readiness blocker 2)
+
+Kubernetes caps the *combined* size of all annotations on an object at 256 KiB — `TotalAnnotationSizeLimitB` in `k8s.io/apimachinery/pkg/api/validation`, enforced as `sum(len(key) + len(value))` over the whole map. There is no per-key limit. A fixed per-feature byte budget therefore cannot guarantee compliance, because foreign annotations (kubectl's `last-applied-configuration`, Helm release metadata, ArgoCD tracking) are unbounded and unknown until publish time.
+
+Three decisions, settling what the earlier amendment left open:
+
+**1. Use the vendored validator, do not hand-roll the byte count.** `k8s.io/apimachinery/pkg/api/validation` is already vendored and listed in `vendor/modules.txt`, and exports `ValidateAnnotationsSize(map[string]string) error` — the same function the API server runs. Call it. A hand-rolled `len(k)+len(v)` loop would duplicate logic that can drift from upstream.
+
+**2. The check belongs in `publishDeviceClass`, and it is feature-agnostic.** That function is the only place the final merged map exists — the builders never see foreign annotations, because those are only known after the `Get`. The coupling objection (teaching shared infrastructure about two capability-summary keys) is resolved by not doing that: `publishDeviceClass` consults a package-level ordered list of TC-owned annotation keys ranked by expendability, and drops from the front until `ValidateAnnotationsSize` passes. It learns nothing about "the capability feature"; expendability is a property of each annotation. A future TC annotation is added to the list and needs no change to the check.
+
+**3. Precedence on overflow: drop derived data before authored data.** This is the principle, not an arbitrary pick:
+
+| Order | Key | Why it drops first |
+|---|---|---|
+| 1 | `.../capabilities` | Largest, and fully reconstructible by any consumer from `Spec.Config` on the same object — it is a derivation of data sitting right next to it. |
+| 2 | `.../capability-summary` | Also derived from `Spec.Config`, but small and human-facing, so it survives longer. |
+| 3 | `.../workload-types`, `.../categories`, `.../description`, `.../display-name` | Administrator-authored. Reconstructible only by finding the source grouping ConfigMap, not from the object itself. Ordering within this tier is by descending expected size and only matters in a pathological case. |
+
+Dropping continues down the list until the map validates. If even an empty TC annotation set does not fit, foreign annotations alone exceed the limit; publish the DeviceClass anyway and let the API server reject it with its own error, rather than inventing a failure mode — at that point the object is broken in a way TC did not cause and cannot fix.
+
+The rationale for dropping *any* TC annotation rather than withholding the update: `Spec.Config` is the functional payload that claim expansion depends on, and annotations are metadata. A DeviceClass that reconciles correctly with less metadata is strictly better than one that cannot be updated at all.
+
+**The 32 KiB per-feature bound stays, with a narrowed purpose.** It is not a correctness guarantee — the combined check above is. It is a sanity bound that keeps one feature's output from crowding out everything else on a normal object, and it fails fast at summary-construction time with a message naming the DeviceClass, rather than silently at the publish-time drop step.
 
 ### Other amendments (smaller, non-blocking)
 
@@ -326,14 +350,9 @@ Requirements:
 - Produce deterministic serialization.
 - Preserve existing DeviceClass annotations.
 - Enforce the 32 KiB feature budget on the combined `capabilities` and `capability-summary` key/value bytes before adding them to `dc.Annotations`.
-- **Before each API create or update, check the final merged annotation map against Kubernetes' 256 KiB combined limit.** Count `len(key) + len(value)` for every annotation, including existing foreign annotations and all TC-owned annotations. `publishDeviceClass` is the first point where the final merged map is available. If adding the summary would exceed the limit, remove both summary keys from the desired annotations, log a surfaced error naming the DeviceClass, and publish the remaining metadata and `Spec.Config`.
+- **Before each API create or update, validate the final merged annotation map with `validation.ValidateAnnotationsSize` from the vendored `k8s.io/apimachinery/pkg/api/validation`.** `publishDeviceClass` is the only place the final merged map exists, so the check lives there. On failure, drop TC-owned annotations in the documented expendability order (`.../capabilities` first, then `.../capability-summary`, then the intent annotations) until the map validates, logging a surfaced error naming the DeviceClass and the keys dropped, then publish the remaining metadata and `Spec.Config`.
 
-  **[OPEN — readiness blocker 2; settle before implementing.]** The *requirement* above is correct: a fixed 32 KiB feature budget cannot by itself guarantee the combined limit is respected, since foreign annotations are unbounded and unknown until publish time. The *placement* is not settled, and the naive reading has two problems worth resolving first:
-
-  1. `publishDeviceClass` is generic infrastructure shared by every DeviceClass TC publishes. Teaching it to recognize and drop two specific capability-summary keys couples a shared function to one feature.
-  2. PR2's four intent annotations (`display-name`, `description`, `categories`, `workload-types`) have identical exposure to the same 256 KiB ceiling, with no equivalent carve-out. On overflow, why are capability keys sacrificed and intent keys preserved? That precedence is a real decision and is currently unstated.
-
-  A cleaner shape, if it holds up: a generic TC-owned annotation budget enforced in `publishDeviceClass` with a documented, feature-agnostic drop order, rather than feature-specific key removal. Whoever implements this should pick an approach and record the reasoning here before writing the check.
+  The check is feature-agnostic: it consults a package-level ordered list of TC-owned keys, not capability-summary-specific logic. See "Annotation budget" at the top of this document for the full rationale, the drop-order table, and why derived annotations drop before administrator-authored ones.
 - **On oversized or unserializable summaries: omit the summary annotations and log a surfaced error naming the DeviceClass, not withhold the entire DeviceClass update.** This matches the codebase's existing convention — `SyncDeviceClasses`/`SyncGroupingDeviceClasses` already accumulate per-object errors (`publishErrs`) and continue processing other objects rather than failing the whole sync on one bad object. Omitting the two annotation keys (and deleting them if previously present, via the existing `mergeTCOwnedMetadata` prefix-based removal) while still publishing the rest of the DeviceClass (labels, intent metadata if present, `Spec.Config`) is self-correcting and loses only this one feature's output for that one object, with a clear log line as evidence.
 
 ### FR-3: Generate Human-Readable Summaries
@@ -741,7 +760,7 @@ This feature is metadata generation and discovery only.
 
 ## 12. Instructions for Claude Code / implementing agent
 
-**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. Both halves of that investigation are now done and acted on: the count intersection and the capacity intersection, both in PR #14. Verify both are present on your implementation base before assuming FR-5 is satisfied — if either is missing, you will reproduce the exact problems documented at the top of this file. The one item still genuinely open is the annotation budget (readiness blocker 2); settle its placement before publishing summaries.
+**[AMENDED]** §12's original "Second: Review design decisions" step asked the implementer to investigate whether aggregate DeviceClasses have a single authoritative `PartitionConfig`, and to document any cases requiring variants or conservative summaries. Both halves of that investigation are now done and acted on: the count intersection and the capacity intersection, both in PR #14. Verify both are present on your implementation base before assuming FR-5 is satisfied — if either is missing, you will reproduce the exact problems documented at the top of this file. The annotation budget (readiness blocker 2) is also settled; implement it as specified under "Annotation budget" and amended FR-2 rather than designing your own.
 
 Everything else in the original §12 (inspect first, implement, validate with `make test`/`make lint`/`make build`, report unavailable tests rather than claiming they passed, deliver the standard summary) is unchanged.
 
