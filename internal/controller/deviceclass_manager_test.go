@@ -1243,3 +1243,56 @@ func TestDeviceClassManager_SyncDeviceClasses_PreservesForeignMetadata(t *testin
 	assert.Equal(t, "team-infra", dc.Annotations["example.com/owner"],
 		"foreign annotation on a partition-path DeviceClass must survive reconciliation")
 }
+
+// TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic
+// covers config.Alignments ordering specifically. GetMatchConstraintRules
+// ranges over TopologyRuleStore's internal map, so with 2+ ConstraintMatch
+// rules configured, the order buildPartitionConfig appends Alignments in is
+// random across calls. sortPartitionConfig must sort the Alignments slice
+// itself (not just each Alignment's Requests) or the marshaled config keeps
+// changing every reconcile, defeating publishDeviceClass's no-op check.
+func TestDeviceClassManager_BuildPartitionConfig_AlignmentsOrderIsDeterministic(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	rules := NewTopologyRuleStore()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+
+	require.NoError(t, rules.LoadFromConfigMap(makeTopologyRuleConfigMap("pcie-root-rule", "default", map[string]string{
+		"attribute":  AttrPCIeRoot,
+		"type":       "string",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	})))
+	require.NoError(t, rules.LoadFromConfigMap(makeTopologyRuleConfigMap("socket-rule", "default", map[string]string{
+		"attribute":  AttrSocket,
+		"type":       "int",
+		"driver":     "gpu.nvidia.com",
+		"constraint": "match",
+	})))
+
+	pcieRoot := "pci0000:00"
+	var socket int64
+	representative := PartitionDevice{
+		DeviceCounts: map[string]int{
+			"gpu.nvidia.com":    1,
+			"rdma.mellanox.com": 1,
+		},
+		Devices: []TopologyDevice{
+			{DriverName: "gpu.nvidia.com", PCIeRoot: &pcieRoot, Socket: &socket},
+			{DriverName: "rdma.mellanox.com", PCIeRoot: &pcieRoot, Socket: &socket},
+		},
+	}
+
+	var firstRaw []byte
+	for i := 0; i < 30; i++ {
+		config, _ := manager.buildPartitionConfig(PartitionFull, representative)
+		require.Len(t, config.Alignments, 2, "both match-constraint rules should produce an alignment")
+		raw, err := json.Marshal(config)
+		require.NoError(t, err)
+		if i == 0 {
+			firstRaw = raw
+			continue
+		}
+		assert.Equal(t, string(firstRaw), string(raw),
+			"buildPartitionConfig must marshal identically across calls with multiple match-constraint rules, iteration %d", i)
+	}
+}

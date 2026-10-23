@@ -81,11 +81,25 @@ type AlignmentConfig struct {
 // its no-op short-circuit would never fire.
 func sortPartitionConfig(config *PartitionConfig) {
 	sort.Slice(config.SubResources, func(i, j int) bool {
-		return config.SubResources[i].DeviceClass < config.SubResources[j].DeviceClass
+		a, b := config.SubResources[i], config.SubResources[j]
+		if a.DeviceClass != b.DeviceClass {
+			return a.DeviceClass < b.DeviceClass
+		}
+		return a.Count < b.Count
 	})
 	for i := range config.Alignments {
 		sort.Strings(config.Alignments[i].Requests)
 	}
+	// Alignments themselves are appended in topology-rule order, which comes
+	// from TopologyRuleStore ranging over a map (random order). Sort them too
+	// so the marshaled config is stable when 2+ match-constraint rules exist.
+	sort.Slice(config.Alignments, func(i, j int) bool {
+		a, b := config.Alignments[i], config.Alignments[j]
+		if a.Attribute != b.Attribute {
+			return a.Attribute < b.Attribute
+		}
+		return strings.Join(a.Requests, ",") < strings.Join(b.Requests, ",")
+	})
 }
 
 // profilePartition tracks a unique partition instance for DeviceClass generation.
@@ -126,6 +140,11 @@ func NewDeviceClassManager(client kubernetes.Interface, driverName string, rules
 // SyncDeviceClasses creates or updates DeviceClass objects for each partition type
 // discovered across all nodes.
 func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []PartitionResult) error {
+	// Errors are accumulated rather than returned immediately so that one
+	// unpublishable DeviceClass does not block every other DeviceClass from
+	// reconciling (same rationale as SyncGroupingDeviceClasses).
+	var publishErrs []error
+
 	// Collect all unique partition types and their profiles.
 	// Cache the partition config to avoid computing it twice (once for key, once for DeviceClass).
 	seen := make(map[string]*profilePartition)
@@ -192,7 +211,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 			}
 		}
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -317,7 +336,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		dc := m.buildDeviceClassFromCache(pp.profile, pp.partType, pp.representative, pp.cachedConfig, CouplingNone, pp.count)
 		dc.Name = string(pp.partType)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -357,7 +376,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 		dc.Name = tierName
 		dc.Labels[CoordinatorDriverName+"/tierName"] = tierName
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
-			return fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err)
+			publishErrs = append(publishErrs, fmt.Errorf("failed to publish tier DeviceClass %s: %w", dc.Name, err))
 		}
 	}
 
@@ -378,7 +397,7 @@ func (m *DeviceClassManager) SyncDeviceClasses(ctx context.Context, results []Pa
 	}
 
 	klog.Infof("Synced %d DeviceClasses", len(seen))
-	return nil
+	return stdliberrors.Join(publishErrs...)
 }
 
 // computeTierName returns the human-readable tier name (eighth, quarter, half, etc.)
@@ -1372,6 +1391,23 @@ func detectPartitionModeAttr(dev TopologyDevice) (attrName string, mode string) 
 // only appears in CEL expressions and Opaque.Driver, never in a metadata key).
 const tcOwnedLabelPrefix = CoordinatorDriverName + "/"
 
+// stringMapEqual compares two string maps by content, treating nil and empty
+// maps as equal (unlike reflect/apiequality.Semantic.DeepEqual, which treats
+// them as different). Without this, a foreign actor setting an empty
+// labels/annotations map (e.g. `{}`) would make publishDeviceClass see a
+// perpetual diff against mergeTCOwnedMetadata's nil-when-empty result.
+func stringMapEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
 // mergeTCOwnedMetadata returns a copy of existing merged with built's
 // TC-owned keys: every TC-owned key present on built is set (added or
 // overwritten), and every TC-owned key present on existing but absent from
@@ -1418,8 +1454,8 @@ func (m *DeviceClassManager) publishDeviceClass(ctx context.Context, dc *resourc
 	merged.Annotations = mergeTCOwnedMetadata(existing.Annotations, dc.Annotations)
 
 	if apiequality.Semantic.DeepEqual(merged.Spec, existing.Spec) &&
-		apiequality.Semantic.DeepEqual(merged.Labels, existing.Labels) &&
-		apiequality.Semantic.DeepEqual(merged.Annotations, existing.Annotations) {
+		stringMapEqual(merged.Labels, existing.Labels) &&
+		stringMapEqual(merged.Annotations, existing.Annotations) {
 		return nil
 	}
 
