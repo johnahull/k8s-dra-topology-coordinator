@@ -2,9 +2,12 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	klog "k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
 )
@@ -17,6 +20,22 @@ type GroupingDevice struct {
 	Class    string            `json:"class"`
 	Count    int               `json:"count"`
 	Capacity map[string]string `json:"capacity,omitempty"`
+}
+
+// IntentMetadata adds optional human-readable metadata to a device grouping.
+type IntentMetadata struct {
+	DisplayName   string
+	Description   string
+	IntentLevel   string
+	Categories    []string
+	WorkloadTypes []string
+	Visibility    string
+}
+
+// IsOffering reports whether the grouping has any intent metadata.
+func (m IntentMetadata) IsOffering() bool {
+	return m.DisplayName != "" || m.Description != "" || m.IntentLevel != "" ||
+		len(m.Categories) > 0 || len(m.WorkloadTypes) > 0 || m.Visibility != ""
 }
 
 // DeviceGrouping defines a named combination of devices that should be
@@ -32,6 +51,10 @@ type DeviceGrouping struct {
 	Fallback string
 	// Devices lists the device classes and counts required in this grouping.
 	Devices []GroupingDevice
+	// Intent contains optional offering metadata from the source ConfigMap.
+	Intent IntentMetadata
+
+	sourceConfigMap string
 }
 
 // GroupingStore loads and manages device groupings from ConfigMaps.
@@ -61,6 +84,7 @@ func (s *GroupingStore) LoadFromConfigMap(cm *corev1.ConfigMap) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse device grouping from %s/%s: %w", cm.Namespace, cm.Name, err)
 	}
+	grouping.sourceConfigMap = cm.Namespace + "/" + cm.Name
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,11 +123,16 @@ func (s *GroupingStore) GetGroupings() []DeviceGrouping {
 			}
 			devicesCopy[i] = gd
 		}
+		intentCopy := g.Intent
+		intentCopy.Categories = append([]string(nil), g.Intent.Categories...)
+		intentCopy.WorkloadTypes = append([]string(nil), g.Intent.WorkloadTypes...)
 		result = append(result, DeviceGrouping{
-			Name:      g.Name,
-			Alignment: g.Alignment,
-			Fallback:  g.Fallback,
-			Devices:   devicesCopy,
+			Name:            g.Name,
+			Alignment:       g.Alignment,
+			Fallback:        g.Fallback,
+			Devices:         devicesCopy,
+			Intent:          intentCopy,
+			sourceConfigMap: g.sourceConfigMap,
 		})
 	}
 	return result
@@ -117,6 +146,50 @@ func parseDeviceGrouping(cm *corev1.ConfigMap) (DeviceGrouping, error) {
 		return g, fmt.Errorf("missing required field 'name'")
 	}
 	g.Name = name
+	sanitizedName := sanitizeForName(name)
+	if len(sanitizedName) > 56 {
+		return g, fmt.Errorf("invalid field 'name': sanitized value %q exceeds 56 characters", sanitizedName)
+	}
+	if problems := validation.IsDNS1123Label(sanitizedName); len(problems) > 0 {
+		return g, fmt.Errorf("invalid field 'name': sanitized value %q is not a DNS-1123 label: %s",
+			sanitizedName, strings.Join(problems, "; "))
+	}
+
+	intent := IntentMetadata{
+		DisplayName: cm.Data["displayName"],
+		Description: cm.Data["description"],
+	}
+	if utf8.RuneCountInString(intent.DisplayName) > 63 {
+		return g, fmt.Errorf("invalid field 'displayName': must be at most 63 characters")
+	}
+	if utf8.RuneCountInString(intent.Description) > 1024 {
+		return g, fmt.Errorf("invalid field 'description': must be at most 1024 characters")
+	}
+
+	if intent.IntentLevel = cm.Data["intentLevel"]; intent.IntentLevel != "" {
+		switch intent.IntentLevel {
+		case "workload", "capability", "hardware-specific":
+		default:
+			return g, fmt.Errorf("invalid intentLevel %q: must be workload, capability, or hardware-specific", intent.IntentLevel)
+		}
+	}
+
+	var err error
+	if intent.Categories, err = parseCommaSeparatedValues("categories", cm.Data["categories"]); err != nil {
+		return g, err
+	}
+	if intent.WorkloadTypes, err = parseCommaSeparatedValues("workloadTypes", cm.Data["workloadTypes"]); err != nil {
+		return g, err
+	}
+
+	if intent.Visibility = cm.Data["visibility"]; intent.Visibility != "" {
+		switch intent.Visibility {
+		case "public", "internal":
+		default:
+			return g, fmt.Errorf("invalid visibility %q: must be public or internal", intent.Visibility)
+		}
+	}
+	g.Intent = intent
 
 	alignment := cm.Data["alignment"]
 	if alignment == "" {
@@ -164,4 +237,32 @@ func parseDeviceGrouping(cm *corev1.ConfigMap) (DeviceGrouping, error) {
 
 	g.Devices = devices
 	return g, nil
+}
+
+func parseCommaSeparatedValues(field, value string) ([]string, error) {
+	const (
+		maxEntries     = 16
+		maxEntryLength = 63
+	)
+
+	seen := make(map[string]struct{})
+	var values []string
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if utf8.RuneCountInString(entry) > maxEntryLength {
+			return nil, fmt.Errorf("invalid %s entry %q: must be at most %d characters", field, entry, maxEntryLength)
+		}
+		if _, ok := seen[entry]; ok {
+			continue
+		}
+		seen[entry] = struct{}{}
+		values = append(values, entry)
+		if len(values) > maxEntries {
+			return nil, fmt.Errorf("invalid %s: must contain at most %d entries", field, maxEntries)
+		}
+	}
+	return values, nil
 }

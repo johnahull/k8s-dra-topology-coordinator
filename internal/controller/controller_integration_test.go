@@ -110,6 +110,118 @@ func waitForDeviceClasses(t *testing.T, ctx context.Context, client kubernetes.I
 	}
 }
 
+func waitForNamedDeviceClass(t *testing.T, ctx context.Context, client kubernetes.Interface, name string, matches func(*resourcev1.DeviceClass) bool) *resourcev1.DeviceClass {
+	t.Helper()
+
+	var result *resourcev1.DeviceClass
+	require.Eventually(t, func() bool {
+		deviceClass, err := client.ResourceV1().DeviceClasses().Get(ctx, name, metav1.GetOptions{})
+		if err != nil || !matches(deviceClass) {
+			return false
+		}
+		result = deviceClass
+		return true
+	}, 30*time.Second, 500*time.Millisecond)
+	return result
+}
+
+func TestIntegration_IntentMetadataPropagation(t *testing.T) {
+	client, teardown := setupEnvtest(t)
+	defer teardown()
+
+	ctx := context.Background()
+	createResourceSlice(t, ctx, client, "gpu-slice-intent", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	})
+	createResourceSlice(t, ctx, client, "nic-slice-intent", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	})
+	grouping := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gpu-inference",
+			Namespace: "default",
+			Labels:    map[string]string{controller.DeviceGroupingLabel: "true"},
+		},
+		Data: map[string]string{
+			"name":          "gpu-inference",
+			"alignment":     "pcieRoot",
+			"devices":       "- class: gpu.nvidia.com\n  count: 1\n- class: rdma.mellanox.com\n  count: 1",
+			"displayName":   "GPU inference",
+			"description":   "GPU and NIC resources for inference",
+			"intentLevel":   "workload",
+			"categories":    "ai,inference",
+			"workloadTypes": "training,serving",
+			"visibility":    "public",
+		},
+	}
+	_, err := client.CoreV1().ConfigMaps("default").Create(ctx, grouping, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	startController := func() (context.CancelFunc, chan error) {
+		runCtx, cancel := context.WithCancel(ctx)
+		done := make(chan error, 1)
+		ctrl := controller.NewController(client, controller.CoordinatorDriverName, controller.PartitionModeGroupings)
+		go func() { done <- ctrl.Run(runCtx) }()
+		return cancel, done
+	}
+	cancel, done := startController()
+	defer func() {
+		if cancel != nil {
+			cancel()
+			<-done
+		}
+	}()
+
+	intentLevelKey := controller.CoordinatorDriverName + "/intent-level"
+	visibilityKey := controller.CoordinatorDriverName + "/visibility"
+	displayNameKey := controller.CoordinatorDriverName + "/display-name"
+	descriptionKey := controller.CoordinatorDriverName + "/description"
+	categoriesKey := controller.CoordinatorDriverName + "/categories"
+	workloadTypesKey := controller.CoordinatorDriverName + "/workload-types"
+	deviceClass := waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+		return dc.Labels[controller.CoordinatorDriverName+"/managed"] == "true"
+	})
+	require.Equal(t, "workload", deviceClass.Labels[intentLevelKey])
+	require.Equal(t, "public", deviceClass.Labels[visibilityKey])
+	require.Equal(t, "GPU inference", deviceClass.Annotations[displayNameKey])
+	require.Equal(t, "GPU and NIC resources for inference", deviceClass.Annotations[descriptionKey])
+	require.Equal(t, "ai,inference", deviceClass.Annotations[categoriesKey])
+	require.Equal(t, "training,serving", deviceClass.Annotations[workloadTypesKey])
+	originalConfig := deviceClass.Spec.Config
+
+	grouping, err = client.CoreV1().ConfigMaps("default").Get(ctx, grouping.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	grouping.Data["displayName"] = "AI training accelerator"
+	_, err = client.CoreV1().ConfigMaps("default").Update(ctx, grouping, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+		return dc.Annotations[displayNameKey] == "AI training accelerator"
+	})
+	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
+
+	grouping, err = client.CoreV1().ConfigMaps("default").Get(ctx, grouping.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	delete(grouping.Data, "description")
+	_, err = client.CoreV1().ConfigMaps("default").Update(ctx, grouping, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+		_, exists := dc.Annotations[descriptionKey]
+		return !exists
+	})
+	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
+
+	cancel()
+	require.NoError(t, <-done)
+	cancel = nil
+	require.NoError(t, client.ResourceV1().DeviceClasses().Delete(ctx, "gpu-inference", metav1.DeleteOptions{}))
+	cancel, done = startController()
+	deviceClass = waitForNamedDeviceClass(t, ctx, client, "gpu-inference", func(dc *resourcev1.DeviceClass) bool {
+		_, hasDescription := dc.Annotations[descriptionKey]
+		return dc.Labels[intentLevelKey] == "workload" && dc.Annotations[displayNameKey] == "AI training accelerator" && !hasDescription
+	})
+	assert.Equal(t, originalConfig, deviceClass.Spec.Config)
+}
+
 func TestIntegration_ControllerCreatesDeviceClasses(t *testing.T) {
 	client, teardown := setupEnvtest(t)
 	defer teardown()

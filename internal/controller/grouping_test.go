@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +21,148 @@ func makeGroupingConfigMap(name string, data map[string]string) *corev1.ConfigMa
 		},
 		Data: data,
 	}
+}
+
+func validGroupingData(name string) map[string]string {
+	return map[string]string{
+		"name":      name,
+		"alignment": "pcieRoot",
+		"devices":   "- class: gpu.example.com\n  count: 1",
+	}
+}
+
+func uniqueList(itemLength, count int) string {
+	values := make([]string, count)
+	for i := range values {
+		values[i] = strings.Repeat("x", itemLength-1) + string(rune('a'+i))
+	}
+	return strings.Join(values, ",")
+}
+
+func TestParseDeviceGrouping_IntentMetadata(t *testing.T) {
+	for _, level := range []string{"workload", "capability", "hardware-specific"} {
+		t.Run(level, func(t *testing.T) {
+			data := validGroupingData("test")
+			data["displayName"] = "GPU inference"
+			data["description"] = "GPU workloads"
+			data["intentLevel"] = level
+			data["categories"] = " ai,,inference, ,ai "
+			data["workloadTypes"] = "training, serving,,"
+			data["visibility"] = "public"
+
+			grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+			require.NoError(t, err)
+			intent := grouping.Intent
+			assert.Equal(t, "GPU inference", intent.DisplayName)
+			assert.Equal(t, "GPU workloads", intent.Description)
+			assert.Equal(t, level, intent.IntentLevel)
+			assert.Equal(t, []string{"ai", "inference"}, intent.Categories)
+			assert.Equal(t, []string{"training", "serving"}, intent.WorkloadTypes)
+			assert.Equal(t, "public", intent.Visibility)
+			assert.True(t, intent.IsOffering())
+		})
+	}
+
+	t.Run("internal visibility", func(t *testing.T) {
+		data := validGroupingData("test")
+		data["visibility"] = "internal"
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+		require.NoError(t, err)
+		assert.Equal(t, "internal", grouping.Intent.Visibility)
+	})
+
+	t.Run("maximum boundaries", func(t *testing.T) {
+		data := validGroupingData("test")
+		data["displayName"] = strings.Repeat("é", 63)
+		data["description"] = strings.Repeat("界", 1024)
+		data["categories"] = uniqueList(63, 16)
+		data["workloadTypes"] = uniqueList(63, 16)
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", data))
+		require.NoError(t, err)
+		assert.Equal(t, 16, len(grouping.Intent.Categories))
+		assert.Equal(t, 16, len(grouping.Intent.WorkloadTypes))
+	})
+
+	t.Run("legacy config has no offering", func(t *testing.T) {
+		grouping, err := parseDeviceGrouping(makeGroupingConfigMap("test", validGroupingData("test")))
+		require.NoError(t, err)
+		assert.False(t, grouping.Intent.IsOffering())
+		assert.Empty(t, grouping.Intent.Visibility)
+	})
+}
+
+func TestParseDeviceGrouping_InvalidIntentMetadata(t *testing.T) {
+	tests := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "intent level", field: "intentLevel", value: "unknown"},
+		{name: "visibility", field: "visibility", value: "private"},
+		{name: "display name too long", field: "displayName", value: strings.Repeat("x", 64)},
+		{name: "description too long", field: "description", value: strings.Repeat("x", 1025)},
+		{name: "too many categories", field: "categories", value: uniqueList(1, 17)},
+		{name: "category too long", field: "categories", value: strings.Repeat("x", 64)},
+		{name: "too many workload types", field: "workloadTypes", value: uniqueList(1, 17)},
+		{name: "workload type too long", field: "workloadTypes", value: strings.Repeat("x", 64)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := validGroupingData("test")
+			data[tt.field] = tt.value
+			err := NewGroupingStore().LoadFromConfigMap(makeGroupingConfigMap("test", data))
+			if assert.Error(t, err) {
+				assert.ErrorContains(t, err, "default/test")
+				assert.ErrorContains(t, err, tt.field)
+			}
+		})
+	}
+}
+
+func TestParseDeviceGrouping_SanitizedNameValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		valid bool
+	}{
+		{name: "1-gpu", valid: true},
+		{name: "gpu.nvidia.com", valid: true},
+		{name: "gpu--nic", valid: true},
+		{name: "gpu_inference"},
+		{name: "-gpu"},
+		{name: "gpu-"},
+		{name: strings.Repeat("g", 57)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := validGroupingData(tt.name)
+			err := NewGroupingStore().LoadFromConfigMap(makeGroupingConfigMap("test", data))
+			if tt.valid {
+				assert.NoError(t, err)
+			} else if assert.Error(t, err) {
+				assert.ErrorContains(t, err, "default/test")
+				assert.ErrorContains(t, err, "name")
+			}
+		})
+	}
+}
+
+func TestGroupingStore_GetGroupingsDeepCopiesIntent(t *testing.T) {
+	store := NewGroupingStore()
+	data := validGroupingData("test")
+	data["categories"] = "gpu,inference"
+	data["workloadTypes"] = "training,serving"
+	require.NoError(t, store.LoadFromConfigMap(makeGroupingConfigMap("test", data)))
+
+	first := store.GetGroupings()
+	require.Len(t, first, 1)
+	require.NotEmpty(t, first[0].Intent.Categories)
+	first[0].Intent.Categories[0] = "mutated"
+
+	second := store.GetGroupings()
+	require.Len(t, second, 1)
+	assert.Equal(t, []string{"gpu", "inference"}, second[0].Intent.Categories)
 }
 
 func TestGroupingStore_LoadFromConfigMap(t *testing.T) {
@@ -194,6 +337,38 @@ func TestGroupingBuilder_BasicPCIeRootAlignment(t *testing.T) {
 		assert.Equal(t, 1, inst.DeviceCounts["gpu.amd.com"])
 		assert.Equal(t, 1, inst.DeviceCounts["dpu.pensando.com"])
 	}
+}
+
+func TestGroupingBuilder_BuildGroupingsCarriesIntentMetadata(t *testing.T) {
+	model := NewTopologyModel()
+	rules := NewTopologyRuleStore()
+	nodeTopo := &NodeTopology{
+		NodeName: "node-1",
+		DevicesByDriver: map[string][]TopologyDevice{"gpu.amd.com": {
+			makeTestDevice("gpu.amd.com", "gpu-0", int64Ptr(0), stringPtr("pcie-0")),
+		}},
+	}
+	model.mu.Lock()
+	model.nodes = map[string]*NodeTopology{"node-1": nodeTopo}
+	model.mu.Unlock()
+
+	builder := NewGroupingBuilder(model, rules)
+	intent := IntentMetadata{
+		DisplayName: "GPU for AI",
+		Categories:  []string{"ai", "inference"},
+		Visibility:  "public",
+	}
+	grouping := DeviceGrouping{
+		Name:      "gpu-inference",
+		Alignment: "pcieRoot",
+		Devices:   []GroupingDevice{{Class: "gpu.amd.com", Count: 1}},
+		Intent:    intent,
+	}
+
+	results := builder.BuildGroupings([]DeviceGrouping{grouping})
+	require.Len(t, results, 1)
+	require.Len(t, results[0].Instances, 1)
+	assert.Equal(t, intent, results[0].Instances[0].Intent)
 }
 
 func TestGroupingBuilder_UnsatisfiableGrouping(t *testing.T) {

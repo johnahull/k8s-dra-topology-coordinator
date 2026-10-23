@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: low-latency-network
+  labels:
+    nodepartition.dra.k8s.io/device-grouping: "true"
+data:
+  name: low-latency-network
+  alignment: pcieRoot
+  fallback: numaNode
+  devices: |
+    - class: rdma.mellanox.com
+      count: 1
+    - class: dpu.pensando.com
+      count: 1
+  displayName: Low-latency network path
+  description: Co-located RDMA and DPU resources for latency-sensitive traffic.
+  intentLevel: capability
+  categories: networking,low-latency
+  workloadTypes: inference,streaming
+  visibility: public

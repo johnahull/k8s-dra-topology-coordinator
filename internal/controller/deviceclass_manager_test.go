@@ -1129,6 +1129,106 @@ func TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateIsDeterministic(t
 	assert.Equal(t, "pcieRoot", dc.Labels[CoordinatorDriverName+"/alignment"])
 }
 
+func TestDeviceClassManager_SyncGroupingDeviceClasses_IntentMetadataOnlyOnAggregate(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, NewTopologyRuleStore())
+	instance := multiDeviceGroupingInstance(0)
+	instance.Intent = IntentMetadata{
+		DisplayName:   "GPU inference",
+		Description:   "GPU and NIC resources for inference",
+		IntentLevel:   "workload",
+		Categories:    []string{"ai", "inference"},
+		WorkloadTypes: []string{"training", "serving"},
+		Visibility:    "public",
+	}
+	results := []GroupingResult{{NodeName: "node-1", Instances: []GroupingInstance{instance}}}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	aggregate, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "workload", aggregate.Labels[CoordinatorDriverName+"/intent-level"])
+	assert.Equal(t, "public", aggregate.Labels[CoordinatorDriverName+"/visibility"])
+	assert.Equal(t, "GPU inference", aggregate.Annotations[CoordinatorDriverName+"/display-name"])
+	assert.Equal(t, "GPU and NIC resources for inference", aggregate.Annotations[CoordinatorDriverName+"/description"])
+	assert.Equal(t, "ai,inference", aggregate.Annotations[CoordinatorDriverName+"/categories"])
+	assert.Equal(t, "training,serving", aggregate.Annotations[CoordinatorDriverName+"/workload-types"])
+	assert.NotContains(t, aggregate.Labels, CoordinatorDriverName+"/railIndex")
+
+	rail, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair-rail0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, rail.Labels, CoordinatorDriverName+"/intent-level")
+	assert.NotContains(t, rail.Labels, CoordinatorDriverName+"/visibility")
+	assert.NotContains(t, rail.Annotations, CoordinatorDriverName+"/display-name")
+	assert.NotContains(t, rail.Annotations, CoordinatorDriverName+"/description")
+	assert.NotContains(t, rail.Annotations, CoordinatorDriverName+"/categories")
+	assert.NotContains(t, rail.Annotations, CoordinatorDriverName+"/workload-types")
+}
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_NoIntentMetadata(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, NewTopologyRuleStore())
+	results := []GroupingResult{{NodeName: "node-1", Instances: []GroupingInstance{multiDeviceGroupingInstance(0)}}}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	for _, dc := range classes.Items {
+		assert.NotContains(t, dc.Labels, CoordinatorDriverName+"/intent-level")
+		assert.NotContains(t, dc.Labels, CoordinatorDriverName+"/visibility")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/display-name")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/description")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/categories")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/workload-types")
+	}
+}
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_AutoDetectedHasNoIntentMetadata(t *testing.T) {
+	model := NewTopologyModel()
+	nodeTopo := &NodeTopology{
+		NodeName: "node-1",
+		DevicesByDriver: map[string][]TopologyDevice{
+			"gpu.amd.com":     {makeTestDevice("gpu.amd.com", "gpu-0", int64Ptr(0), stringPtr("pcie-0"))},
+			"nic.example.com": {makeTestDevice("nic.example.com", "nic-0", int64Ptr(0), stringPtr("pcie-0"))},
+		},
+	}
+	model.mu.Lock()
+	model.nodes = map[string]*NodeTopology{"node-1": nodeTopo}
+	model.mu.Unlock()
+	rules := NewTopologyRuleStore()
+	autoGroupings := NewPartitionBuilder(model, rules).DetectPCIeRootPairings()
+	require.NotEmpty(t, autoGroupings)
+	results := NewGroupingBuilder(model, rules).BuildGroupings(autoGroupings)
+	client := fake.NewSimpleClientset()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, rules)
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	classes, err := client.ResourceV1().DeviceClasses().List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, classes.Items)
+	for _, dc := range classes.Items {
+		assert.NotContains(t, dc.Labels, CoordinatorDriverName+"/intent-level")
+		assert.NotContains(t, dc.Labels, CoordinatorDriverName+"/visibility")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/display-name")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/description")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/categories")
+		assert.NotContains(t, dc.Annotations, CoordinatorDriverName+"/workload-types")
+	}
+}
+
+func TestDeviceClassManager_SyncGroupingDeviceClasses_AggregateOmitsRailIndex(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	manager := NewDeviceClassManager(client, CoordinatorDriverName, NewTopologyRuleStore())
+	results := []GroupingResult{{NodeName: "node-1", Instances: []GroupingInstance{multiDeviceGroupingInstance(0)}}}
+	require.NoError(t, manager.SyncGroupingDeviceClasses(context.Background(), results))
+
+	aggregate, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, aggregate.Labels, CoordinatorDriverName+"/railIndex")
+	rail, err := client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-nic-pair-rail0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "0", rail.Labels[CoordinatorDriverName+"/railIndex"])
+}
+
 func TestDeviceClassManager_PublishDeviceClass_PreservesForeignMetadata(t *testing.T) {
 	client := fake.NewSimpleClientset()
 	rules := NewTopologyRuleStore()

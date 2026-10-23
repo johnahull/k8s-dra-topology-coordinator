@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-inference
+  labels:
+    nodepartition.dra.k8s.io/device-grouping: "true"
+data:
+  name: gpu-inference
+  alignment: pcieRoot
+  fallback: numaNode
+  devices: |
+    - class: gpu.nvidia.com
+      count: 1
+    - class: rdma.mellanox.com
+      count: 1
+  displayName: GPU inference
+  description: GPU and network resources aligned for inference workloads.
+  intentLevel: workload
+  categories: ai,inference
+  workloadTypes: training,serving
+  visibility: public

@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-nic-aligned
+  labels:
+    nodepartition.dra.k8s.io/device-grouping: "true"
+data:
+  name: gpu-nic-aligned
+  alignment: pcieRoot
+  fallback: numaNode
+  devices: |
+    - class: gpu.nvidia.com
+      count: 1
+    - class: rdma.mellanox.com
+      count: 1
+  displayName: PCIe-aligned GPU and NIC
+  description: A hardware-specific offering pairing a GPU with its local NIC.
+  intentLevel: hardware-specific
+  categories: accelerator,networking
+  workloadTypes: training,distributed-inference
+  visibility: internal
