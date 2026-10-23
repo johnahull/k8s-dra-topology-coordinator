@@ -304,6 +304,40 @@ func (c *Controller) reconcile(ctx context.Context) error {
 		// runs cleanup, so deleting the last grouping ConfigMap removes its
 		// DeviceClasses instead of leaving them orphaned indefinitely.
 		groupingResults := c.groupingBuilder.BuildGroupings(mergedGroupings)
+		deviceClassCollisions := detectGroupingDeviceClassNameCollisions(groupingResults)
+		if len(deviceClassCollisions) > 0 {
+			classNames := make([]string, 0, len(deviceClassCollisions))
+			for className := range deviceClassCollisions {
+				classNames = append(classNames, className)
+			}
+			sort.Strings(classNames)
+
+			sourcesByGrouping := make(map[string]string, len(mergedGroupings))
+			for _, grouping := range mergedGroupings {
+				source := grouping.sourceConfigMap
+				if source == "" {
+					source = "auto-detected"
+				}
+				sourcesByGrouping[grouping.Name] = source
+			}
+
+			details := make([]string, 0, len(classNames))
+			for _, className := range classNames {
+				groupingNames := deviceClassCollisions[className]
+				sources := make([]string, 0, len(groupingNames))
+				for _, groupingName := range groupingNames {
+					sources = append(sources, sourcesByGrouping[groupingName])
+				}
+				sort.Strings(sources)
+				detail := fmt.Sprintf("DeviceClass %q would be emitted by data.name values %v from ConfigMaps %v", className, groupingNames, sources)
+				klog.ErrorS(fmt.Errorf("generated grouping DeviceClass name collision: %s", detail),
+					"Generated grouping DeviceClass name collision", "field", "data.name",
+					"deviceClassName", className, "groupingNames", groupingNames, "configMaps", sources)
+				details = append(details, detail)
+			}
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("generated grouping DeviceClass name collision: %s", strings.Join(details, "; "))
+		}
 
 		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
 			metrics.ReconciliationErrors.Inc()
@@ -536,6 +570,39 @@ func detectSanitizedNameCollisions(groupings []DeviceGrouping) map[string][]Devi
 			return groupings[i].Name < groupings[j].Name
 		})
 		collisions[sanitizedName] = groupings
+	}
+	return collisions
+}
+
+func detectGroupingDeviceClassNameCollisions(results []GroupingResult) map[string][]string {
+	ownersByName := make(map[string]map[string]struct{})
+	for _, result := range results {
+		for _, instance := range result.Instances {
+			groupingName := instance.GroupingName
+			classNames := []string{
+				sanitizeForName(groupingName),
+				fmt.Sprintf("%s-rail%d", sanitizeForName(groupingName), instance.RailIndex),
+			}
+			for _, className := range classNames {
+				if ownersByName[className] == nil {
+					ownersByName[className] = make(map[string]struct{})
+				}
+				ownersByName[className][groupingName] = struct{}{}
+			}
+		}
+	}
+
+	collisions := make(map[string][]string)
+	for className, owners := range ownersByName {
+		if len(owners) < 2 {
+			continue
+		}
+		groupingNames := make([]string, 0, len(owners))
+		for groupingName := range owners {
+			groupingNames = append(groupingNames, groupingName)
+		}
+		sort.Strings(groupingNames)
+		collisions[className] = groupingNames
 	}
 	return collisions
 }

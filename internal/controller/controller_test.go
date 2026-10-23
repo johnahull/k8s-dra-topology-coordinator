@@ -78,6 +78,46 @@ func TestController_Reconcile_SanitizedCollisionPreservesExistingDeviceClass(t *
 	assert.Equal(t, existing.Labels, after.Labels)
 }
 
+func TestController_Reconcile_GeneratedNameCollisionPreservesExistingDeviceClass(t *testing.T) {
+	existing := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-rail0",
+			Labels: map[string]string{
+				CoordinatorDriverName + "/managed":  "true",
+				CoordinatorDriverName + "/grouping": "previous-offering",
+			},
+			Annotations: map[string]string{"foreign.example.com/owner": "preserve"},
+		},
+	}
+	client := k8sfake.NewSimpleClientset(existing)
+	ctrl := NewController(client, CoordinatorDriverName, PartitionModeGroupings)
+	ctrl.Model().UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+
+	for _, groupingName := range []string{"gpu", "gpu-rail0"} {
+		data := validGroupingData(groupingName)
+		data["devices"] = "- class: gpu.nvidia.com\n  count: 1"
+		if groupingName == "gpu-rail0" {
+			data["intentLevel"] = "workload"
+		}
+		require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap(groupingName, data)))
+	}
+
+	err := ctrl.reconcile(context.Background())
+	assert.Error(t, err)
+	if err != nil {
+		for _, want := range []string{"gpu-rail0", "default/gpu", "default/gpu-rail0"} {
+			assert.Contains(t, err.Error(), want)
+		}
+	}
+
+	after, getErr := client.ResourceV1().DeviceClasses().Get(context.Background(), existing.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	assert.Equal(t, existing.Labels, after.Labels)
+	assert.Equal(t, existing.Annotations, after.Annotations)
+}
+
 func TestGroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping(t *testing.T) {
 	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
 	original := makeGroupingConfigMap("test", validGroupingData("existing-offering"))

@@ -21,7 +21,7 @@
 - Emit intent labels and annotations on aggregate DeviceClasses only. Do not add intent metadata to auto-detected groupings or per-rail DeviceClasses. Emit visibility only when explicitly configured.
 - `IsOffering()` is true exactly when at least one scalar field is non-empty or either list has an entry.
 - Preserve the existing exact-name override: a user-defined grouping replaces an auto-detected grouping of the same raw name. Detect duplicate raw names only among user-defined groupings.
-- Detect sanitized-name collisions on the merged list and log the conflicting `data.name` values and ConfigMap sources. Return an error before grouping publication when any collision exists. This prevents nondeterministic writes and preserves the last successfully published grouping DeviceClasses; other grouping updates wait until the conflict is fixed.
+- Detect sanitized-name collisions on the merged list and collisions between emitted aggregate/per-rail DeviceClass names. Log the conflicting `data.name` values and ConfigMap sources. Return an error before grouping publication when any collision exists. This prevents nondeterministic writes and preserves the last successfully published grouping DeviceClasses; other grouping updates wait until the conflict is fixed.
 - Keep the last valid cached grouping after an invalid ConfigMap update; log that its cached metadata is stale and identify the source ConfigMap.
 - Do not change webhook claim expansion, add a CRD/controller/Event/RBAC permission, or implement request-level claim rejection.
 - Categories and workload types are annotations, not label-selector fields. Document that distinction and the deferred request-level rejection limitation.
@@ -35,6 +35,7 @@
 - Missing metadata and auto-detected groupings produce no intent keys; aggregate classes omit `railIndex`; rail classes receive no intent keys.
 - Removing configured metadata removes the coordinator-owned key while preserving foreign labels/annotations and leaving `Spec.Config` unchanged.
 - Exact raw-name duplicates are diagnosed only among user groupings; distinct raw names that sanitize identically are diagnosed after merge and excluded from the build input.
+- Different grouping names must not emit the same aggregate/per-rail DeviceClass name (for example, `gpu` and `gpu-rail0`); detect satisfiable output-name collisions before sync and preserve existing classes.
 
 ---
 
@@ -83,15 +84,18 @@
 **Interfaces:**
 - Add `func detectDuplicateGroupingNames(userDefined []DeviceGrouping) map[string][]string`, mapping each duplicate raw name to its source ConfigMaps.
 - Add `func detectSanitizedNameCollisions(groupings []DeviceGrouping) map[string][]DeviceGrouping`.
+- Add `func detectGroupingDeviceClassNameCollisions(results []GroupingResult) map[string][]string` to detect output names owned by multiple groupings.
 
 - [ ] **Step 1: Add `TestController_Reconcile_DuplicateUserNamesLogsActionableError`** with two user-defined ConfigMaps sharing `data.name`; capture logs and assert they identify the field, raw name, and both source ConfigMaps. Include a user-defined grouping that exactly overrides an auto-detected grouping and assert it is not reported as a duplicate.
 - [ ] **Step 2: Add `TestController_Reconcile_SanitizedCollisionPreservesExistingDeviceClass`**. Seed the fake client with an existing managed grouping DeviceClass, load ConfigMaps named `gpu.inference` and `gpu-inference`, call `reconcile`, and assert it returns an actionable error while preserving the existing DeviceClass.
-- [ ] **Step 3: Add `TestGroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping`**. Load a valid grouping, call the update handler with invalid metadata, capture the error log, and verify that it names the ConfigMap/stale cache and that the previous grouping remains available.
-- [ ] **Step 4: Run the focused controller tests** with `go test ./internal/controller -run 'Test(Controller_Reconcile_(DuplicateUserNamesLogsActionableError|SanitizedCollisionPreservesExistingDeviceClass)|GroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping)'`. Expected: tests compile and fail because the diagnostics/recovery and stale-cache log are not implemented.
-- [ ] **Step 5: Implement duplicate-name detection** inside `if !skipGroupings`, on the user-defined slice only and before merge. Log `field=data.name`, duplicate raw name, and source ConfigMaps at error level; do not abort reconciliation or change exact-name override behavior.
-- [ ] **Step 6: Implement sanitized-name detection after `mergeGroupings`**. Log `field=data.name`, conflicting sanitized key, raw names, and sources; increment reconciliation errors and return before `BuildGroupings` and `SyncGroupingDeviceClasses`, preserving last-known-good grouping DeviceClasses and preventing cleanup.
-- [ ] **Step 7: Clarify the invalid-update error log** to say the cached grouping is retained and stale, including ConfigMap namespace/name. Preserve the existing behavior of not replacing the cached value.
-- [ ] **Step 8: Rerun the focused controller tests** and the existing `TestMergeGroupings_UserOverridesAuto`.
+- [ ] **Step 3: Add `TestController_Reconcile_GeneratedNameCollisionPreservesExistingDeviceClass`**. Use satisfiable groupings named `gpu` and `gpu-rail0`, seed an existing managed `gpu-rail0` class, and assert reconciliation returns an actionable error without changing that class.
+- [ ] **Step 4: Add `TestGroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping`**. Load a valid grouping, call the update handler with invalid metadata, capture the error log, and verify that it names the ConfigMap/stale cache and that the previous grouping remains available.
+- [ ] **Step 5: Run the focused controller tests** with `go test ./internal/controller -run 'Test(Controller_Reconcile_(DuplicateUserNamesLogsActionableError|SanitizedCollisionPreservesExistingDeviceClass|GeneratedNameCollisionPreservesExistingDeviceClass)|GroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping)'`. Expected: tests compile and fail because the diagnostics/recovery and stale-cache log are not implemented.
+- [ ] **Step 6: Implement duplicate-name detection** inside `if !skipGroupings`, on the user-defined slice only and before merge. Log `field=data.name`, duplicate raw name, and source ConfigMaps at error level; do not abort reconciliation or change exact-name override behavior.
+- [ ] **Step 7: Implement sanitized-name detection after `mergeGroupings`**. Log `field=data.name`, conflicting sanitized key, raw names, and sources; increment reconciliation errors and return before `BuildGroupings` and `SyncGroupingDeviceClasses`, preserving last-known-good grouping DeviceClasses and preventing cleanup.
+- [ ] **Step 8: Detect collisions among emitted class names after `BuildGroupings` and before `SyncGroupingDeviceClasses`**. Report the emitted class name, conflicting raw grouping names, and ConfigMap sources; increment reconciliation errors and return before publication/cleanup.
+- [ ] **Step 9: Clarify the invalid-update error log** to say the cached grouping is retained and stale, including ConfigMap namespace/name. Preserve the existing behavior of not replacing the cached value.
+- [ ] **Step 10: Rerun the focused controller tests** and the existing `TestMergeGroupings_UserOverridesAuto`.
 
 ### Task 3: Carry intent metadata through grouping instances
 
@@ -180,6 +184,7 @@ State that `categories` and `workloadTypes` are comma-joined annotations and can
 - The architect found the prior collision-suppression proposal could delete existing managed DeviceClasses through normal cleanup. The user confirmed the revised policy: return before grouping publication, preserving prior classes and delaying all grouping updates until the conflict is fixed.
 - Parser tests must assert that invalid values identify both the offending field and source ConfigMap. Collision diagnostics must identify `data.name`, raw/sanitized names, and source ConfigMaps.
 - Full E2E requires external mock-device/Vagrant infrastructure and is not part of local verification by default.
+- Final review found that distinct valid grouping names can still collide after per-rail suffixes are added; the plan now checks actual satisfied output names before manager sync.
 
 ## Architect Review
 
