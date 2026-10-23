@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -248,16 +250,94 @@ func (c *Controller) reconcile(ctx context.Context) error {
 	}
 
 	if !skipGroupings {
+		duplicateNames := detectDuplicateGroupingNames(groupings)
+		names := make([]string, 0, len(duplicateNames))
+		for name := range duplicateNames {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			sources := duplicateNames[name]
+			klog.ErrorS(fmt.Errorf("multiple ConfigMaps define grouping %q", name),
+				"Duplicate user-defined device grouping", "field", "data.name",
+				"groupingName", name, "configMaps", sources)
+		}
+
 		// Auto-detect PCIe root pairings (GPU+NIC, GPU+NVMe, etc.)
 		autoGroupings := c.partitionBuilder.DetectPCIeRootPairings()
 
 		// Merge: ConfigMap-defined groupings override auto-detected ones with the same name
 		mergedGroupings := mergeGroupings(autoGroupings, groupings)
+		collisions := detectSanitizedNameCollisions(mergedGroupings)
+		if len(collisions) > 0 {
+			keys := make([]string, 0, len(collisions))
+			for key := range collisions {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			details := make([]string, 0, len(keys))
+			for _, key := range keys {
+				groupings := collisions[key]
+				rawNames := make([]string, 0, len(groupings))
+				sources := make([]string, 0, len(groupings))
+				for _, grouping := range groupings {
+					rawNames = append(rawNames, grouping.Name)
+					if grouping.sourceConfigMap == "" {
+						sources = append(sources, "auto-detected")
+					} else {
+						sources = append(sources, grouping.sourceConfigMap)
+					}
+				}
+				sort.Strings(rawNames)
+				sort.Strings(sources)
+				detail := fmt.Sprintf("field=data.name sanitized=%q rawNames=%v configMaps=%v", key, rawNames, sources)
+				klog.ErrorS(fmt.Errorf("sanitized grouping name collision: %s", detail),
+					"Sanitized grouping name collision", "field", "data.name", "sanitizedName", key,
+					"groupingNames", rawNames, "configMaps", sources)
+				details = append(details, detail)
+			}
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("sanitized grouping name collision: %s", strings.Join(details, "; "))
+		}
 
 		// Always sync, even with zero groupings: SyncGroupingDeviceClasses still
 		// runs cleanup, so deleting the last grouping ConfigMap removes its
 		// DeviceClasses instead of leaving them orphaned indefinitely.
 		groupingResults := c.groupingBuilder.BuildGroupings(mergedGroupings)
+		deviceClassCollisions := detectGroupingDeviceClassNameCollisions(groupingResults)
+		if len(deviceClassCollisions) > 0 {
+			classNames := make([]string, 0, len(deviceClassCollisions))
+			for className := range deviceClassCollisions {
+				classNames = append(classNames, className)
+			}
+			sort.Strings(classNames)
+
+			sourcesByGrouping := make(map[string]string, len(mergedGroupings))
+			for _, grouping := range mergedGroupings {
+				source := grouping.sourceConfigMap
+				if source == "" {
+					source = "auto-detected"
+				}
+				sourcesByGrouping[grouping.Name] = source
+			}
+
+			details := make([]string, 0, len(classNames))
+			for _, className := range classNames {
+				groupingNames := deviceClassCollisions[className]
+				sources := make([]string, 0, len(groupingNames))
+				for _, groupingName := range groupingNames {
+					sources = append(sources, sourcesByGrouping[groupingName])
+				}
+				sort.Strings(sources)
+				detail := fmt.Sprintf("DeviceClass %q would be emitted by data.name values %v from ConfigMaps %v", className, groupingNames, sources)
+				klog.ErrorS(fmt.Errorf("generated grouping DeviceClass name collision: %s", detail),
+					"Generated grouping DeviceClass name collision", "field", "data.name",
+					"deviceClassName", className, "groupingNames", groupingNames, "configMaps", sources)
+				details = append(details, detail)
+			}
+			metrics.ReconciliationErrors.Inc()
+			return fmt.Errorf("generated grouping DeviceClass name collision: %s", strings.Join(details, "; "))
+		}
 
 		if err := c.classManager.SyncGroupingDeviceClasses(ctx, groupingResults); err != nil {
 			metrics.ReconciliationErrors.Inc()
@@ -400,7 +480,8 @@ func (c *Controller) onGroupingConfigMapUpdate(_, newObj interface{}) {
 		return
 	}
 	if err := c.groupingStore.LoadFromConfigMap(cm); err != nil {
-		klog.Errorf("Failed to update device grouping from %s/%s: %v", cm.Namespace, cm.Name, err)
+		klog.Errorf("Failed to update device grouping from %s/%s; retaining stale cached grouping: %v",
+			cm.Namespace, cm.Name, err)
 		return
 	}
 	if c.synced {
@@ -444,6 +525,97 @@ func mergeGroupings(autoDetected, userDefined []DeviceGrouping) []DeviceGrouping
 		merged = append(merged, g)
 	}
 	return merged
+}
+
+func detectDuplicateGroupingNames(userDefined []DeviceGrouping) map[string][]string {
+	sourcesByName := make(map[string][]string)
+	for _, grouping := range userDefined {
+		source := grouping.sourceConfigMap
+		if source == "" {
+			source = "unknown source"
+		}
+		sourcesByName[grouping.Name] = append(sourcesByName[grouping.Name], source)
+	}
+
+	duplicates := make(map[string][]string)
+	for name, sources := range sourcesByName {
+		if len(sources) > 1 {
+			sort.Strings(sources)
+			duplicates[name] = sources
+		}
+	}
+	return duplicates
+}
+
+func detectSanitizedNameCollisions(groupings []DeviceGrouping) map[string][]DeviceGrouping {
+	bySanitizedName := make(map[string]map[string]DeviceGrouping)
+	for _, grouping := range groupings {
+		sanitizedName := sanitizeForName(grouping.Name)
+		if bySanitizedName[sanitizedName] == nil {
+			bySanitizedName[sanitizedName] = make(map[string]DeviceGrouping)
+		}
+		bySanitizedName[sanitizedName][grouping.Name] = grouping
+	}
+
+	collisions := make(map[string][]DeviceGrouping)
+	for sanitizedName, byRawName := range bySanitizedName {
+		if len(byRawName) < 2 {
+			continue
+		}
+		groupings := make([]DeviceGrouping, 0, len(byRawName))
+		for _, grouping := range byRawName {
+			groupings = append(groupings, grouping)
+		}
+		sort.Slice(groupings, func(i, j int) bool {
+			return groupings[i].Name < groupings[j].Name
+		})
+		collisions[sanitizedName] = groupings
+	}
+	return collisions
+}
+
+func detectGroupingDeviceClassNameCollisions(results []GroupingResult) map[string][]string {
+	seen := make(map[string]bool)
+	var representatives []GroupingInstance
+	for _, result := range results {
+		for _, instance := range result.Instances {
+			key := groupingInstanceKey(instance)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			representatives = append(representatives, instance)
+		}
+	}
+
+	ownersByName := make(map[string]map[string]struct{})
+	for _, instance := range representatives {
+		groupingName := instance.GroupingName
+		classNames := []string{
+			sanitizeForName(groupingName),
+			fmt.Sprintf("%s-rail%d", sanitizeForName(groupingName), instance.RailIndex),
+		}
+		for _, className := range classNames {
+			if ownersByName[className] == nil {
+				ownersByName[className] = make(map[string]struct{})
+			}
+			ownersByName[className][groupingName] = struct{}{}
+		}
+	}
+
+	collisions := make(map[string][]string)
+	for className, owners := range ownersByName {
+		if len(owners) < 2 {
+			continue
+		}
+		groupingNames := make([]string, 0, len(owners))
+		for groupingName := range owners {
+			groupingNames = append(groupingNames, groupingName)
+		}
+		sort.Strings(groupingNames)
+		collisions[className] = groupingNames
+	}
+	return collisions
 }
 
 func countGroupingDeviceClasses(results []GroupingResult) int {

@@ -424,6 +424,59 @@ func TestInvalidPartitionConfigReturnsAllow(t *testing.T) {
 	assert.Empty(t, resp.Response.Patch)
 }
 
+func TestIntentMetadataDoesNotChangeClaimExpansion(t *testing.T) {
+	partConfig := controller.PartitionConfig{
+		Kind: "PartitionConfig",
+		SubResources: []controller.SubResourceConfig{
+			{DeviceClass: "gpu.nvidia.com", Count: 2},
+			{DeviceClass: "rdma.mellanox.com", Count: 2},
+		},
+		Alignments: []controller.AlignmentConfig{{
+			Attribute: "resource.kubernetes.io/pcieRoot",
+			Requests:  []string{"gpu.nvidia.com", "rdma.mellanox.com"},
+		}},
+	}
+	bare := makePartitionDeviceClass("bare-offering", partConfig)
+	withIntent := makePartitionDeviceClass("intent-offering", partConfig)
+	withIntent.Labels = map[string]string{
+		controller.CoordinatorDriverName + "/intent-level": "workload",
+		controller.CoordinatorDriverName + "/visibility":   "public",
+	}
+	withIntent.Annotations = map[string]string{
+		controller.CoordinatorDriverName + "/display-name":   "GPU inference",
+		controller.CoordinatorDriverName + "/categories":     "ai,inference",
+		controller.CoordinatorDriverName + "/workload-types": "training,serving",
+	}
+	expander := NewClaimExpander(fake.NewSimpleClientset(bare, withIntent))
+	claim := &resourcev1.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: "default"},
+		Spec: resourcev1.ResourceClaimSpec{Devices: resourcev1.DeviceClaim{Requests: []resourcev1.DeviceRequest{{
+			Name: "offering",
+			Exactly: &resourcev1.ExactDeviceRequest{
+				DeviceClassName: "bare-offering",
+				Count:           1,
+			},
+		}}}},
+	}
+	barePatches, err := expander.expandClaim(context.Background(), claim)
+	require.NoError(t, err)
+
+	intentClaim := claim.DeepCopy()
+	intentClaim.Spec.Devices.Requests[0].Exactly.DeviceClassName = "intent-offering"
+	intentPatches, err := expander.expandClaim(context.Background(), intentClaim)
+	require.NoError(t, err)
+	assert.Equal(t, barePatches, intentPatches, "intent metadata must not change request or constraint patches")
+
+	bareConfig, err := expander.getPartitionConfig(context.Background(), "bare-offering")
+	require.NoError(t, err)
+	intentConfig, err := expander.getPartitionConfig(context.Background(), "intent-offering")
+	require.NoError(t, err)
+	require.NotNil(t, bareConfig)
+	require.NotNil(t, intentConfig)
+	assert.Equal(t, partConfig, *bareConfig)
+	assert.Equal(t, *bareConfig, *intentConfig)
+}
+
 func TestExpandClaimDirectly(t *testing.T) {
 	partConfig := controller.PartitionConfig{
 		Kind: "PartitionConfig",

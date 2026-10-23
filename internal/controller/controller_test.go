@@ -1,11 +1,224 @@
 package controller
 
 import (
+	"bytes"
+	"context"
+	"os"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	resourcev1 "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	klog "k8s.io/klog/v2"
 )
+
+func captureKlog(t *testing.T, call func()) string {
+	t.Helper()
+	var output bytes.Buffer
+	klog.LogToStderr(false)
+	klog.SetOutput(&output)
+	t.Cleanup(func() {
+		klog.SetOutput(os.Stderr)
+		klog.LogToStderr(true)
+	})
+	call()
+	return output.String()
+}
+
+func addGPUAndNICTopology(ctrl *Controller) {
+	ctrl.Model().UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+	ctrl.Model().UpdateFromResourceSlice(makeResourceSlice("nic-slice", "rdma.mellanox.com", "node-1", "nic-pool", []resourcev1.Device{
+		makeNICDevice("nic-0", 0, "pcie-0"),
+	}))
+}
+
+func TestController_Reconcile_DuplicateUserNamesLogsActionableError(t *testing.T) {
+	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
+	for _, cmName := range []string{"first", "second"} {
+		require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(
+			makeGroupingConfigMap(cmName, validGroupingData("shared-offering")),
+		))
+	}
+
+	logs := captureKlog(t, func() {
+		require.NoError(t, ctrl.reconcile(context.Background()))
+	})
+
+	assert.Contains(t, logs, "data.name")
+	assert.Contains(t, logs, "shared-offering")
+	assert.Contains(t, logs, "default/first")
+	assert.Contains(t, logs, "default/second")
+}
+
+func TestController_Reconcile_AutoGroupingOverrideIsNotDiagnosedAsDuplicate(t *testing.T) {
+	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
+	addGPUAndNICTopology(ctrl)
+	autoGroupings := ctrl.partitionBuilder.DetectPCIeRootPairings()
+	require.Len(t, autoGroupings, 1)
+	groupingName := autoGroupings[0].Name
+	data := validGroupingData(groupingName)
+	data["devices"] = "- class: gpu.nvidia.com\n  count: 1\n- class: rdma.mellanox.com\n  count: 1"
+	data["displayName"] = "User-defined override"
+	require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap("override", data)))
+
+	logs := captureKlog(t, func() {
+		require.NoError(t, ctrl.reconcile(context.Background()))
+	})
+	assert.NotContains(t, logs, "Duplicate user-defined device grouping")
+	deviceClass, err := ctrl.client.ResourceV1().DeviceClasses().Get(context.Background(), sanitizeForName(groupingName), metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "User-defined override", deviceClass.Annotations[CoordinatorDriverName+"/display-name"])
+}
+
+func TestController_Reconcile_AutoAndUserSanitizedCollisionPreservesExistingDeviceClass(t *testing.T) {
+	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
+	addGPUAndNICTopology(ctrl)
+	autoGroupings := ctrl.partitionBuilder.DetectPCIeRootPairings()
+	require.Len(t, autoGroupings, 1)
+	autoName := autoGroupings[0].Name
+	userName := strings.ReplaceAll(autoName, "-", ".")
+	require.Equal(t, sanitizeForName(autoName), sanitizeForName(userName))
+
+	existing := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: sanitizeForName(autoName),
+			Labels: map[string]string{
+				CoordinatorDriverName + "/managed":  "true",
+				CoordinatorDriverName + "/grouping": "previous-offering",
+			},
+		},
+	}
+	_, err := ctrl.client.ResourceV1().DeviceClasses().Create(context.Background(), existing, metav1.CreateOptions{})
+	require.NoError(t, err)
+	data := validGroupingData(userName)
+	data["devices"] = "- class: gpu.nvidia.com\n  count: 1\n- class: rdma.mellanox.com\n  count: 1"
+	require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap("user-conflict", data)))
+
+	err = ctrl.reconcile(context.Background())
+	assert.Error(t, err)
+	if err != nil {
+		for _, want := range []string{"data.name", autoName, userName, "auto-detected", "default/user-conflict"} {
+			assert.Contains(t, err.Error(), want)
+		}
+	}
+	after, getErr := ctrl.client.ResourceV1().DeviceClasses().Get(context.Background(), existing.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	assert.Equal(t, existing.Labels, after.Labels)
+}
+
+func TestController_Reconcile_SanitizedCollisionPreservesExistingDeviceClass(t *testing.T) {
+	existing := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-inference",
+			Labels: map[string]string{
+				CoordinatorDriverName + "/managed":  "true",
+				CoordinatorDriverName + "/grouping": "gpu-inference",
+			},
+		},
+	}
+	client := k8sfake.NewSimpleClientset(existing)
+	ctrl := NewController(client, CoordinatorDriverName, PartitionModeGroupings)
+	for _, groupingName := range []string{"gpu.inference", "gpu-inference"} {
+		cmName := strings.ReplaceAll(groupingName, ".", "-dot-")
+		data := validGroupingData(groupingName)
+		require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap(cmName, data)))
+	}
+
+	err := ctrl.reconcile(context.Background())
+	assert.Error(t, err)
+	if err != nil {
+		for _, want := range []string{"data.name", "gpu.inference", "gpu-inference", "default/gpu-dot-inference", "default/gpu-inference"} {
+			assert.Contains(t, err.Error(), want)
+		}
+	}
+
+	after, getErr := client.ResourceV1().DeviceClasses().Get(context.Background(), existing.Name, metav1.GetOptions{})
+	require.NoError(t, getErr, "a sanitized-name collision must not run stale-class cleanup")
+	assert.Equal(t, existing.Labels, after.Labels)
+}
+
+func TestController_Reconcile_GeneratedNameCollisionPreservesExistingDeviceClass(t *testing.T) {
+	existing := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "gpu-rail0",
+			Labels: map[string]string{
+				CoordinatorDriverName + "/managed":  "true",
+				CoordinatorDriverName + "/grouping": "previous-offering",
+			},
+			Annotations: map[string]string{"foreign.example.com/owner": "preserve"},
+		},
+	}
+	client := k8sfake.NewSimpleClientset(existing)
+	ctrl := NewController(client, CoordinatorDriverName, PartitionModeGroupings)
+	ctrl.Model().UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+	}))
+
+	for _, groupingName := range []string{"gpu", "gpu-rail0"} {
+		data := validGroupingData(groupingName)
+		data["devices"] = "- class: gpu.nvidia.com\n  count: 1"
+		if groupingName == "gpu-rail0" {
+			data["intentLevel"] = "workload"
+		}
+		require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap(groupingName, data)))
+	}
+
+	err := ctrl.reconcile(context.Background())
+	assert.Error(t, err)
+	if err != nil {
+		for _, want := range []string{"gpu-rail0", "default/gpu", "default/gpu-rail0"} {
+			assert.Contains(t, err.Error(), want)
+		}
+	}
+
+	after, getErr := client.ResourceV1().DeviceClasses().Get(context.Background(), existing.Name, metav1.GetOptions{})
+	require.NoError(t, getErr)
+	assert.Equal(t, existing.Labels, after.Labels)
+	assert.Equal(t, existing.Annotations, after.Annotations)
+}
+
+func TestController_Reconcile_GeneratedNameCollisionUsesPublishedRails(t *testing.T) {
+	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
+	ctrl.Model().UpdateFromResourceSlice(makeResourceSlice("gpu-slice", "gpu.nvidia.com", "node-1", "gpu-pool", []resourcev1.Device{
+		makeGPUDevice("gpu-0", 0, "pcie-0"),
+		makeGPUDevice("gpu-1", 0, "pcie-0"),
+	}))
+	for _, groupingName := range []string{"gpu", "gpu-rail1"} {
+		data := validGroupingData(groupingName)
+		data["devices"] = "- class: gpu.nvidia.com\n  count: 1"
+		require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(makeGroupingConfigMap(groupingName, data)))
+	}
+
+	require.NoError(t, ctrl.reconcile(context.Background()))
+	deviceClass, err := ctrl.client.ResourceV1().DeviceClasses().Get(context.Background(), "gpu-rail1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, "gpu-rail1", deviceClass.Labels[CoordinatorDriverName+"/grouping"])
+	assert.NotContains(t, deviceClass.Labels, CoordinatorDriverName+"/railIndex")
+}
+
+func TestGroupingConfigMapUpdate_InvalidUpdateKeepsCachedGrouping(t *testing.T) {
+	ctrl := NewController(k8sfake.NewSimpleClientset(), CoordinatorDriverName, PartitionModeGroupings)
+	original := makeGroupingConfigMap("test", validGroupingData("existing-offering"))
+	require.NoError(t, ctrl.groupingStore.LoadFromConfigMap(original))
+	updated := original.DeepCopy()
+	updated.Data["intentLevel"] = "unknown"
+
+	logs := captureKlog(t, func() {
+		ctrl.onGroupingConfigMapUpdate(original, updated)
+	})
+
+	assert.Contains(t, logs, "default/test")
+	assert.Contains(t, logs, "stale")
+	groupings := ctrl.groupingStore.GetGroupings()
+	require.Len(t, groupings, 1)
+	assert.Equal(t, "existing-offering", groupings[0].Name)
+}
 
 func TestMergeGroupings_UserOverridesAuto(t *testing.T) {
 	auto := []DeviceGrouping{

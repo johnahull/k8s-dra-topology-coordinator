@@ -1026,15 +1026,7 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	for _, result := range results {
 		for _, inst := range result.Instances {
 			config := m.buildGroupingConfig(inst)
-
-			nk := numaKey(inst.NUMANodes)
-			pk := strings.Join(inst.PCIeRoots, "-")
-			key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
-			if pk != "" {
-				key += "-" + sanitizeForName(pk)
-			} else if nk != "" {
-				key += "-numa" + nk
-			}
+			key := groupingInstanceKey(inst)
 
 			if entry, ok := seen[key]; ok {
 				entry.count++
@@ -1063,6 +1055,8 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 	// Emit aggregate DeviceClasses (one per grouping name, no NUMA selector).
 	// Lets users request "any gpu-nic-pair" without specifying a NUMA node;
 	// the scheduler finds a satisfiable placement automatically.
+	// All instances for a grouping name share one merged source, so intent is
+	// identical; combining sources under one name later would invalidate this.
 	aggregates := make(map[string]*groupingEntry)
 	for _, entry := range seen {
 		name := entry.representative.GroupingName
@@ -1090,6 +1084,8 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 		dc := m.buildGroupingDeviceClass(aggKey, entry.representative, entry.config, entry.count)
 		dc.Name = sanitizeForName(entry.representative.GroupingName)
 		delete(dc.Labels, CoordinatorDriverName+"/numa")
+		delete(dc.Labels, CoordinatorDriverName+"/railIndex")
+		applyIntentMetadata(dc, entry.representative.Intent)
 		if err := m.publishDeviceClass(ctx, dc); err != nil {
 			publishErrs = append(publishErrs, fmt.Errorf("failed to publish aggregate DeviceClass %s: %w", dc.Name, err))
 		}
@@ -1113,6 +1109,18 @@ func (m *DeviceClassManager) SyncGroupingDeviceClasses(ctx context.Context, resu
 
 	klog.Infof("Synced %d grouping DeviceClasses", len(seen))
 	return stdliberrors.Join(publishErrs...)
+}
+
+func groupingInstanceKey(inst GroupingInstance) string {
+	nk := numaKey(inst.NUMANodes)
+	pk := strings.Join(inst.PCIeRoots, "-")
+	key := truncateLabel(inst.GroupingName) + "-" + sanitizeForName(inst.Alignment)
+	if pk != "" {
+		key += "-" + sanitizeForName(pk)
+	} else if nk != "" {
+		key += "-numa" + nk
+	}
+	return key
 }
 
 // buildGroupingConfig builds the opaque PartitionConfig from a grouping instance.
@@ -1264,6 +1272,42 @@ func (m *DeviceClassManager) buildGroupingDeviceClass(
 				},
 			},
 		},
+	}
+}
+
+func applyIntentMetadata(dc *resourcev1.DeviceClass, intent IntentMetadata) {
+	if !intent.IsOffering() {
+		return
+	}
+
+	if intent.IntentLevel != "" || intent.Visibility != "" {
+		if dc.Labels == nil {
+			dc.Labels = make(map[string]string)
+		}
+		if intent.IntentLevel != "" {
+			dc.Labels[CoordinatorDriverName+"/intent-level"] = intent.IntentLevel
+		}
+		if intent.Visibility != "" {
+			dc.Labels[CoordinatorDriverName+"/visibility"] = intent.Visibility
+		}
+	}
+
+	if intent.DisplayName != "" || intent.Description != "" || len(intent.Categories) > 0 || len(intent.WorkloadTypes) > 0 {
+		if dc.Annotations == nil {
+			dc.Annotations = make(map[string]string)
+		}
+		if intent.DisplayName != "" {
+			dc.Annotations[CoordinatorDriverName+"/display-name"] = intent.DisplayName
+		}
+		if intent.Description != "" {
+			dc.Annotations[CoordinatorDriverName+"/description"] = intent.Description
+		}
+		if len(intent.Categories) > 0 {
+			dc.Annotations[CoordinatorDriverName+"/categories"] = strings.Join(intent.Categories, ",")
+		}
+		if len(intent.WorkloadTypes) > 0 {
+			dc.Annotations[CoordinatorDriverName+"/workload-types"] = strings.Join(intent.WorkloadTypes, ",")
+		}
 	}
 }
 

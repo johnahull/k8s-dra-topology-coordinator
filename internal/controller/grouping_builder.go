@@ -18,6 +18,8 @@ type GroupingInstance struct {
 	NodeName string
 	// GroupingName is the admin-defined grouping name.
 	GroupingName string
+	// Intent contains optional discovery metadata from the source grouping.
+	Intent IntentMetadata
 	// Alignment is the topology attribute this instance matched on
 	// (e.g., "pcieRoot", "numaNode").
 	Alignment string
@@ -280,6 +282,7 @@ func (b *GroupingBuilder) buildInstance(
 		Name:               name,
 		NodeName:           nodeName,
 		GroupingName:       grouping.Name,
+		Intent:             grouping.Intent,
 		Alignment:          alignment,
 		DeviceCounts:       make(map[string]int),
 		DeviceCapacity:     make(map[string]map[string]string),
