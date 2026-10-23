@@ -168,7 +168,7 @@ func TestIntegration_IntentMetadataPropagation(t *testing.T) {
 	defer func() {
 		if cancel != nil {
 			cancel()
-			<-done
+			require.NoError(t, <-done)
 		}
 	}()
 
